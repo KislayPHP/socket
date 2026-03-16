@@ -1,0 +1,16 @@
+{
+  "name": "kislayphp_socket",
+  "version": "0.0.1",
+  "description": "Node-side helpers and assets for the Kislay Socket transport package.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"No JavaScript tests defined\""
+  },
+  "keywords": [
+    "kislayphp",
+    "socket",
+    "realtime",
+    "websocket"
+  ],
+  "license": "Apache-2.0"
+}

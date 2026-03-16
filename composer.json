@@ -1,0 +1,53 @@
+{
+    "name": "kislayphp/socket",
+    "description": "High-performance C++ PHP extension providing realtime socket transport for long-running PHP services",
+    "type": "php-ext",
+    "license": "Apache-2.0",
+    "keywords": [
+        "php",
+        "microservices",
+        "php-extension",
+        "cpp-extension",
+        "realtime-protocol",
+        "websocket",
+        "real-time",
+        "php-socket",
+        "php-realtime",
+        "php-namespaces",
+        "php-rooms",
+        "interactive-php",
+        "php-websocket",
+        "socket-transport",
+        "distributed-php"
+    ],
+    "homepage": "https://github.com/KislayPHP/socket",
+    "authors": [
+        {
+            "name": "KislayPHP Team",
+            "email": "team@kislayphp.com"
+        }
+    ],
+    "require": {
+        "php": ">=8.2"
+    },
+    "provide": {
+        "ext-kislayphp_socket": "*"
+    },
+    "suggest": {
+        "kislayphp/core": "HTTP/HTTPS server foundation",
+        "kislayphp/config": "Dynamic configuration management",
+        "kislayphp/discovery": "Service discovery integration",
+        "kislayphp/gateway": "API gateway with real-time features",
+        "kislayphp/metrics": "Real-time metrics monitoring",
+        "kislayphp/queue": "Message queuing integration"
+    },
+    "support": {
+        "issues": "https://github.com/KislayPHP/socket/issues",
+        "source": "https://github.com/KislayPHP/socket",
+        "docs": "https://github.com/KislayPHP/socket/blob/main/README.md"
+    },
+    "php-ext": {
+        "extension-name": "kislayphp_socket",
+        "configure-options": []
+    }
+}
