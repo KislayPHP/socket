@@ -712,6 +712,11 @@ static bool kislay_engineio_send_packet(php_kislay_socket_server_t *server, kisl
         mg_websocket_write(session.ws_conn, MG_WEBSOCKET_OPCODE_TEXT, packet.data(), packet.size());
         return true;
     }
+    // Backpressure: cap per-session queue at 512 messages, drop oldest
+    static const size_t KISLAY_SOCKET_MAX_QUEUE = 512;
+    if (session.queue.size() >= KISLAY_SOCKET_MAX_QUEUE) {
+        session.queue.erase(session.queue.begin()); // drop oldest
+    }
     session.queue.push_back(packet);
     server->cv.notify_all();
     return true;
@@ -1521,6 +1526,10 @@ static void kislay_ws_ready_handler(struct mg_connection *conn, void *cbdata) {
 }
 
 static int kislay_ws_data_handler(struct mg_connection *conn, int bits, char *data, size_t data_len, void *cbdata) {
+#ifdef ZTS
+    ZEND_TSRMLS_CACHE_UPDATE();
+#endif
+
     auto *server = static_cast<php_kislay_socket_server_t *>(cbdata);
     std::vector<kislay_pending_call> pending;
     std::unique_lock<std::mutex> lock(server->lock);
