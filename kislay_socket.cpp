@@ -1829,6 +1829,15 @@ PHP_METHOD(KislaySocketServer, listen) {
     options.push_back(opt_port.c_str());
     options.push_back("num_threads");
     options.push_back("1");
+    // civetweb's mg_websocket_write_exec() sends the frame header and payload
+    // as two separate mg_write() calls. Without tcp_nodelay, Nagle holds the
+    // small payload write until the client ACKs the header write, and that
+    // ACK is itself delayed (~40ms) with nothing to piggyback on - the same
+    // Nagle/delayed-ACK interaction found and fixed in the Gateway extension
+    // (see gateway's PHP_METHOD(KislayPHPGateway, listen)). For a realtime
+    // socket transport this would tax every single outgoing message.
+    options.push_back("tcp_nodelay");
+    options.push_back("1");
     options.push_back(nullptr);
 
     server->ctx = mg_start(nullptr, server, options.data());
