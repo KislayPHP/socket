@@ -13,8 +13,27 @@ if test "$PHP_KISLAYPHP_SOCKET" != "no"; then
   PHP_ADD_LIBRARY(stdc++,, KISLAYPHP_SOCKET_SHARED_LIBADD)
   PHP_SUBST(KISLAYPHP_SOCKET_SHARED_LIBADD)
 
-  CFLAGS="$CFLAGS -DOPENSSL_API_3_0"
-  CXXFLAGS="$CXXFLAGS -DOPENSSL_API_3_0"
+  dnl USE_WEBSOCKET enables civetweb's websocket upgrade handling
+  dnl (handle_websocket_request and its call sites are compiled out
+  dnl entirely otherwise). Without this, mg_set_websocket_handler()/
+  dnl mg_websocket_write() still link fine but every WS upgrade request
+  dnl silently falls through with no response, since Socket\Server's core
+  dnl advertised feature depends on this civetweb code path existing.
+  dnl
+  dnl NO_SSL_DL: without it, civetweb resolves OpenSSL/libcrypto functions
+  dnl (including the SHA1 digest used by the websocket handshake) lazily at
+  dnl runtime via dlopen()/dlsym() into a private function-pointer table,
+  dnl populated only when TLS is actually configured (initialize_openssl()
+  dnl is gated behind the MG_FEATURES_SSL flag). This is a plain-HTTP (no
+  dnl TLS) server, so that table is never populated and every websocket
+  dnl handshake calls through a NULL function pointer - SIGSEGV inside
+  dnl send_websocket_handshake() on the very first upgrade attempt, on
+  dnl every single connection. We already link directly against real
+  dnl libssl/libcrypto above (PKG_CHECK_MODULES), so there's no reason to
+  dnl go through civetweb's own dlopen indirection at all; NO_SSL_DL makes
+  dnl civetweb call the linked OpenSSL functions directly instead.
+  CFLAGS="$CFLAGS -DOPENSSL_API_3_0 -DUSE_WEBSOCKET -DNO_SSL_DL"
+  CXXFLAGS="$CXXFLAGS -DOPENSSL_API_3_0 -DUSE_WEBSOCKET -DNO_SSL_DL"
   if test -f ../rpc/gen/platform.pb.cc; then
     RPC_GEN_DIR=`pwd`/../rpc/gen
     PHP_ADD_INCLUDE($RPC_GEN_DIR)

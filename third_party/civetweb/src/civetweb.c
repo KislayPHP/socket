@@ -13415,11 +13415,17 @@ send_websocket_handshake(struct mg_connection *conn, const char *websock_key)
 	DEBUG_TRACE("%s", "Send websocket handshake");
 
 #if defined(OPENSSL_API_3_0)
+	/* EVP_get_digestbyname("sha1") returns NULL unless the "sha1" name is
+	 * explicitly registered/fetched from a provider, which is not guaranteed
+	 * under OpenSSL 3.0's default initialization - EVP_Digest() then
+	 * dereferences that NULL type pointer, segfaulting on every websocket
+	 * handshake. EVP_sha1() returns the built-in EVP_MD directly, with no
+	 * provider/name-lookup dependency. */
 	EVP_Digest((unsigned char *)buf,
 	           (uint32_t)strlen(buf),
 	           (unsigned char *)sha,
 	           NULL,
-	           EVP_get_digestbyname("sha1"),
+	           EVP_sha1(),
 	           NULL);
 #else
 	SHA1_Init(&sha_ctx);
