@@ -635,7 +635,21 @@ static std::vector<std::string> kislay_engineio_parse_payload(const char *data, 
     return packets;
 }
 
+// Every kislay_call_php() invocation happens on a civetweb I/O thread, never
+// the original PHP script thread (which is parked inside listen()). On NTS
+// builds there's no TSRM/per-thread Zend engine isolation - calling into
+// Zend from a thread with no synchronization relative to whichever thread
+// last touched it is a data race at the C++ memory-model level (no
+// happens-before edge for zend_mm/executor_globals state), and reliably
+// corrupts the heap (zend_mm_panic) the first time any callback fires.
+// Core's own dedicated-thread PHP execution (PhpRuntimePool::worker_main,
+// core/src/runtime/php_runtime.cpp) has the identical shape - a spawned
+// thread calling into Zend - and serializes every such call through a
+// single mutex (nts_lock_) for exactly this reason. Mirror that here.
+static std::mutex kislay_socket_php_call_lock;
+
 static bool kislay_call_php(zval *callable, uint32_t argc, zval *argv, zval *retval) {
+    std::lock_guard<std::mutex> guard(kislay_socket_php_call_lock);
     ZVAL_UNDEF(retval);
     if (call_user_function(EG(function_table), nullptr, callable, retval, argc, argv) == FAILURE) {
         return false;
