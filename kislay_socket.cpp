@@ -635,21 +635,25 @@ static std::vector<std::string> kislay_engineio_parse_payload(const char *data, 
     return packets;
 }
 
-// Every kislay_call_php() invocation happens on a civetweb I/O thread, never
-// the original PHP script thread (which is parked inside listen()). On NTS
-// builds there's no TSRM/per-thread Zend engine isolation - calling into
-// Zend from a thread with no synchronization relative to whichever thread
-// last touched it is a data race at the C++ memory-model level (no
-// happens-before edge for zend_mm/executor_globals state), and reliably
-// corrupts the heap (zend_mm_panic) the first time any callback fires.
-// Core's own dedicated-thread PHP execution (PhpRuntimePool::worker_main,
-// core/src/runtime/php_runtime.cpp) has the identical shape - a spawned
-// thread calling into Zend - and serializes every such call through a
-// single mutex (nts_lock_) for exactly this reason. Mirror that here.
-static std::mutex kislay_socket_php_call_lock;
+// Every Zend/PHP API touched from a civetweb I/O thread or the Redis
+// subscriber thread happens off the original PHP script thread (which is
+// parked inside listen()). On NTS builds there's no TSRM/per-thread Zend
+// engine isolation - calling into Zend from a thread with no
+// synchronization relative to whichever thread last touched it is a data
+// race at the C++ memory-model level (no happens-before edge for
+// zend_mm/executor_globals state), and reliably corrupts the heap
+// (zend_mm_panic) - not just from concurrent user callback invocations, but
+// from ANY Zend call (php_json_decode, zval construction/destruction, etc)
+// made from more than one such thread. Core's own dedicated-thread PHP
+// execution (PhpRuntimePool::worker_main, core/src/runtime/php_runtime.cpp)
+// has the identical shape and serializes every such call through a single
+// mutex (nts_lock_) for exactly this reason. This mirrors that, as a
+// recursive mutex since call sites nest (e.g. kislay_call_php is invoked
+// from within an already-locked packet-handling scope).
+static std::recursive_mutex kislay_socket_php_call_lock;
 
 static bool kislay_call_php(zval *callable, uint32_t argc, zval *argv, zval *retval) {
-    std::lock_guard<std::mutex> guard(kislay_socket_php_call_lock);
+    std::lock_guard<std::recursive_mutex> guard(kislay_socket_php_call_lock);
     ZVAL_UNDEF(retval);
     if (call_user_function(EG(function_table), nullptr, callable, retval, argc, argv) == FAILURE) {
         return false;
@@ -872,6 +876,9 @@ static bool kislay_parse_socketio_event_packet(const char *data,
         return false;
     }
 
+    // Called from the civetweb worker thread; see kislay_socket_php_call_lock.
+    std::lock_guard<std::recursive_mutex> php_guard(kislay_socket_php_call_lock);
+
     zval decoded;
     if (php_json_decode(&decoded, json, json_len, true, PHP_JSON_PARSER_DEFAULT_DEPTH) != SUCCESS) {
         return false;
@@ -904,6 +911,8 @@ static void kislay_queue_event_locked(php_kislay_socket_server_t *server,
                                       zval *payload,
                                       std::vector<kislay_pending_call> &pending,
                                       const kislay_socket_session *session_ptr = nullptr) {
+    // ZVAL_COPY below touches Zend refcounting; see kislay_socket_php_call_lock.
+    std::lock_guard<std::recursive_mutex> php_guard(kislay_socket_php_call_lock);
     auto hit = server->handlers.find(event);
     auto ack_hit = server->ack_handlers.find(event);
     if (hit == server->handlers.end() && ack_hit == server->ack_handlers.end()) {
@@ -939,6 +948,10 @@ static void kislay_queue_event_locked(php_kislay_socket_server_t *server,
 
 static void kislay_run_pending_calls(php_kislay_socket_server_t *server,
                                      std::vector<kislay_pending_call> &pending) {
+    // Covers the whole loop body, not just the kislay_call_php() calls inside
+    // it - object_init_ex/ZVAL_COPY/zval_ptr_dtor throughout also touch Zend.
+    // See kislay_socket_php_call_lock.
+    std::lock_guard<std::recursive_mutex> php_guard(kislay_socket_php_call_lock);
     for (auto &call : pending) {
         // ── Auth gate ────────────────────────────────────────────────────────
         if (call.check_auth && server->has_auth_handler) {
@@ -1332,6 +1345,15 @@ static int kislay_http_handler(struct mg_connection *conn, void *cbdata) {
     }
 
     if (method == "GET") {
+        // Deliberately NOT holding kislay_socket_php_call_lock here: this
+        // branch never touches Zend (no packet parsing/dispatch, just
+        // session bookkeeping and reading session.queue), and it blocks for
+        // up to ping_interval_ms inside cv.wait_for() below. cv.wait_for()
+        // only releases the std::mutex passed to it (server->lock) while
+        // waiting - it would NOT release a lock_guard-held
+        // kislay_socket_php_call_lock, which would starve the Redis
+        // subscriber thread out of ever acquiring it to deliver a message
+        // for the whole duration of every long poll.
         std::unique_lock<std::mutex> lock(server->lock);
         auto sid_it = query.find("sid");
         if (sid_it == query.end()) {
@@ -1417,6 +1439,11 @@ static int kislay_http_handler(struct mg_connection *conn, void *cbdata) {
         }
 
         std::vector<kislay_pending_call> pending;
+        // Acquired before server->lock, always in this order (also the order
+        // used by the Redis subscriber thread) to avoid a lock-order
+        // inversion between this mutex and server->lock. See
+        // kislay_socket_php_call_lock.
+        std::lock_guard<std::recursive_mutex> php_guard(kislay_socket_php_call_lock);
         std::unique_lock<std::mutex> lock(server->lock);
         auto session_it = server->sessions.find(sid_it->second);
         if (session_it == server->sessions.end()) {
@@ -1546,6 +1573,9 @@ static int kislay_ws_data_handler(struct mg_connection *conn, int bits, char *da
 
     auto *server = static_cast<php_kislay_socket_server_t *>(cbdata);
     std::vector<kislay_pending_call> pending;
+    // See kislay_socket_php_call_lock for why this is acquired before
+    // server->lock, consistently, everywhere.
+    std::lock_guard<std::recursive_mutex> php_guard(kislay_socket_php_call_lock);
     std::unique_lock<std::mutex> lock(server->lock);
     auto sid_it = server->conn_to_sid.find(conn);
     if (sid_it == server->conn_to_sid.end()) {
@@ -1594,6 +1624,9 @@ static int kislay_ws_data_handler(struct mg_connection *conn, int bits, char *da
 static void kislay_ws_close_handler(const struct mg_connection *conn, void *cbdata) {
     auto *server = static_cast<php_kislay_socket_server_t *>(cbdata);
     std::vector<kislay_pending_call> pending;
+    // See kislay_socket_php_call_lock for why this is acquired before
+    // server->lock, consistently, everywhere.
+    std::lock_guard<std::recursive_mutex> php_guard(kislay_socket_php_call_lock);
     std::unique_lock<std::mutex> lock(server->lock);
 
     auto sid_it = server->conn_to_sid.find(const_cast<struct mg_connection *>(conn));
