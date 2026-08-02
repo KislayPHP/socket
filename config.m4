@@ -32,8 +32,27 @@ if test "$PHP_KISLAYPHP_SOCKET" != "no"; then
   dnl libssl/libcrypto above (PKG_CHECK_MODULES), so there's no reason to
   dnl go through civetweb's own dlopen indirection at all; NO_SSL_DL makes
   dnl civetweb call the linked OpenSSL functions directly instead.
-  CFLAGS="$CFLAGS -DOPENSSL_API_3_0 -DUSE_WEBSOCKET -DNO_SSL_DL"
-  CXXFLAGS="$CXXFLAGS -DOPENSSL_API_3_0 -DUSE_WEBSOCKET -DNO_SSL_DL"
+  dnl -fvisibility=hidden + -DCIVETWEB_API=: civetweb.c exports ~200
+  dnl non-static C functions (mg_start, mg_read, ...) with default (public)
+  dnl visibility - civetweb.h's own CIVETWEB_API macro explicitly
+  dnl re-asserts __attribute__((visibility("default"))) regardless of
+  dnl -fvisibility, unless CIVETWEB_API is already defined (its #ifndef
+  dnl guard), so pre-defining it as empty here is what actually makes
+  dnl -fvisibility=hidden take effect, without touching the vendored
+  dnl header/source at all. PHP extension bundles link with
+  dnl -flat_namespace (confirmed in the actual link command on this
+  dnl platform), so when 2+ extensions that each vendor their own copy of
+  dnl civetweb.c are loaded into the same process (e.g. this extension
+  dnl alongside core or gateway, which also embed civetweb), the dynamic
+  dnl linker can resolve a call in ONE extension's object code to the
+  dnl OTHER extension's same-named symbol - silently running the wrong
+  dnl compiled civetweb, since the compiled versions can differ (different
+  dnl flags, different fixes applied). Hiding everything by default
+  dnl eliminates the collision at its source; get_module() stays exported
+  dnl via ZEND_GET_MODULE's own ZEND_DLEXPORT, independent of this flag -
+  dnl PHP's dlopen()-based loader only ever needs that one symbol by name.
+  CFLAGS="$CFLAGS -DOPENSSL_API_3_0 -DUSE_WEBSOCKET -DNO_SSL_DL -fvisibility=hidden -DCIVETWEB_API="
+  CXXFLAGS="$CXXFLAGS -DOPENSSL_API_3_0 -DUSE_WEBSOCKET -DNO_SSL_DL -fvisibility=hidden -DCIVETWEB_API="
   if test -f ../rpc/gen/platform.pb.cc; then
     RPC_GEN_DIR=`pwd`/../rpc/gen
     PHP_ADD_INCLUDE($RPC_GEN_DIR)
