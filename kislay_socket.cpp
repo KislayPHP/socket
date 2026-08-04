@@ -888,8 +888,32 @@ static std::recursive_mutex kislay_socket_php_call_lock;
 
 static bool kislay_call_php(zval *callable, uint32_t argc, zval *argv, zval *retval) {
     std::lock_guard<std::recursive_mutex> guard(kislay_socket_php_call_lock);
+#if defined(ZEND_CHECK_STACK_LIMIT)
+    /* PHP >= 8.5 registers a per-thread stack base/limit exactly once, when
+     * the request is activated on the main thread (zend_activate() ->
+     * zend_call_stack_init()). It is never refreshed for any OTHER OS thread
+     * that later calls into Zend - such as this civetweb worker thread or the
+     * Redis subscriber thread. Every PHP call made from such a thread is then
+     * checked against the MAIN thread's stack bounds, which are unrelated to
+     * this thread's actual stack memory - spuriously throwing "Maximum call
+     * stack size ... reached. Infinite recursion?" on essentially every call.
+     * That error was silently swallowed here (nothing checked EG(exception)
+     * after the call), and repeated occurrences eventually corrupt the Zend
+     * heap (zend_mm_heap corrupted / SIGABRT). Call the same initializer PHP
+     * itself uses at request startup, once per OS thread - thread_local
+     * ensures this runs exactly once per thread regardless of how many
+     * requests that thread goes on to serve. */
+    static thread_local bool kislay_stack_limit_initialized = false;
+    if (!kislay_stack_limit_initialized) {
+        zend_call_stack_init();
+        kislay_stack_limit_initialized = true;
+    }
+#endif
     ZVAL_UNDEF(retval);
     if (call_user_function(EG(function_table), nullptr, callable, retval, argc, argv) == FAILURE) {
+        return false;
+    }
+    if (UNEXPECTED(EG(exception))) {
         return false;
     }
     return true;
