@@ -27,6 +27,16 @@ extern "C" {
 #include <unordered_set>
 #include <vector>
 
+/* Redis RESP adapter (no hiredis dependency) */
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <errno.h>
+
 #include "Zend/zend_smart_str.h"
 #include "ext/standard/php_var.h"
 
@@ -111,6 +121,179 @@ static std::string kislay_env_string_any(const char *primary, const char *legacy
         }
     }
     return fallback;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Hand-rolled RESP (Redis Serialization Protocol) helpers
+ * No hiredis dependency — plain TCP sockets.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+/* Open a plain blocking TCP connection to Redis. Returns fd >= 0 on success,
+ * -1 on failure. The fd is left in blocking mode. */
+static int kislay_redis_connect(const std::string &host, int port) {
+    struct addrinfo hints = {};
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    char port_buf[16];
+    snprintf(port_buf, sizeof(port_buf), "%d", port);
+
+    struct addrinfo *res = nullptr;
+    if (getaddrinfo(host.c_str(), port_buf, &hints, &res) != 0 || res == nullptr) {
+        return -1;
+    }
+
+    int fd = -1;
+    for (struct addrinfo *rp = res; rp != nullptr; rp = rp->ai_next) {
+        fd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) { continue; }
+        if (::connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) { break; }
+        ::close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+
+/* Format a RESP multi-bulk command and write it to fd.
+ * Returns true on success. Thread-safe when called with proper locking. */
+static bool kislay_redis_send_command(int fd, const std::vector<std::string> &args) {
+    if (fd < 0 || args.empty()) { return false; }
+
+    std::string buf;
+    buf.reserve(256);
+    buf += '*';
+    buf += std::to_string(static_cast<int>(args.size()));
+    buf += "\r\n";
+    for (const auto &arg : args) {
+        buf += '$';
+        buf += std::to_string(static_cast<int>(arg.size()));
+        buf += "\r\n";
+        buf += arg;
+        buf += "\r\n";
+    }
+
+    const char *ptr = buf.data();
+    size_t remaining = buf.size();
+    while (remaining > 0) {
+        ssize_t sent = ::send(fd, ptr, remaining, MSG_NOSIGNAL);
+        if (sent <= 0) { return false; }
+        ptr       += sent;
+        remaining -= static_cast<size_t>(sent);
+    }
+    return true;
+}
+
+/* Read one CRLF-terminated line from fd into line (without the CRLF).
+ * timeout_ms <= 0 means block indefinitely.
+ * Returns true on success, false on timeout/error/EOF. If timed_out is
+ * non-null, it is set to true only for a clean poll() timeout (no data
+ * available yet, connection still presumably alive) and false for a real
+ * error/EOF (connection dead, caller should stop trusting this fd) - the
+ * two cases must not be treated the same by callers, or a dropped
+ * connection turns into a tight busy-spin retrying poll() forever instead
+ * of tearing down and reconnecting. */
+static bool kislay_redis_read_line(int fd, std::string &line, int timeout_ms, bool *timed_out = nullptr) {
+    line.clear();
+    if (timed_out != nullptr) { *timed_out = false; }
+    for (;;) {
+        if (timeout_ms > 0) {
+            struct pollfd pfd = {};
+            pfd.fd     = fd;
+            pfd.events = POLLIN;
+            int rc = ::poll(&pfd, 1, timeout_ms);
+            if (rc == 0) {
+                if (timed_out != nullptr) { *timed_out = true; }
+                return false;
+            }
+            if (rc < 0) { return false; }
+        }
+
+        char c;
+        ssize_t n = ::recv(fd, &c, 1, 0);
+        if (n <= 0) { return false; }
+        if (c == '\r') {
+            /* Consume the trailing \n */
+            char lf;
+            n = ::recv(fd, &lf, 1, 0);
+            if (n <= 0) { return false; }
+            return true;
+        }
+        line += c;
+    }
+}
+
+/* Read exactly nbytes from fd into buf. Returns true on success. */
+static bool kislay_redis_read_exact(int fd, char *buf, size_t nbytes, int timeout_ms) {
+    size_t got = 0;
+    while (got < nbytes) {
+        if (timeout_ms > 0) {
+            struct pollfd pfd = {};
+            pfd.fd     = fd;
+            pfd.events = POLLIN;
+            int rc = ::poll(&pfd, 1, timeout_ms);
+            if (rc <= 0) { return false; }
+        }
+        ssize_t n = ::recv(fd, buf + got, nbytes - got, 0);
+        if (n <= 0) { return false; }
+        got += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+/* Read a bulk string from fd given its declared length.
+ * Consumes the trailing CRLF. */
+static bool kislay_redis_read_bulk(int fd, int length, std::string &out, int timeout_ms) {
+    if (length < 0) { out.clear(); return true; } /* nil bulk */
+    out.resize(static_cast<size_t>(length));
+    if (!kislay_redis_read_exact(fd, &out[0], static_cast<size_t>(length), timeout_ms)) {
+        return false;
+    }
+    /* Consume CRLF */
+    char crlf[2];
+    return kislay_redis_read_exact(fd, crlf, 2, timeout_ms);
+}
+
+/* Thread-safe PUBLISH to a Redis channel. Returns true if at least 0
+ * subscribers received it (including 0 — that is still a success). */
+static bool kislay_redis_publish(int pub_fd, std::mutex &lock,
+                                 const std::string &channel,
+                                 const std::string &payload) {
+    if (pub_fd < 0) { return false; }
+    std::lock_guard<std::mutex> guard(lock);
+    if (!kislay_redis_send_command(pub_fd, {"PUBLISH", channel, payload})) {
+        return false;
+    }
+    /* Read the integer reply :N\r\n — we don't care about N */
+    std::string line;
+    return kislay_redis_read_line(pub_fd, line, 2000);
+}
+
+/* Build JSON payload for cross-node delivery: {"event":"...", "data":<json>} */
+static std::string kislay_redis_make_payload(const std::string &event, zval *data) {
+    zval arr;
+    array_init(&arr);
+    add_assoc_string(&arr, "event", event.c_str());
+    if (data != nullptr && Z_TYPE_P(data) != IS_UNDEF) {
+        add_assoc_zval(&arr, "data", data);
+        Z_TRY_ADDREF_P(data);
+    } else {
+        add_assoc_null(&arr, "data");
+    }
+    smart_str buf = {0};
+    if (php_json_encode(&buf, &arr, 0) != SUCCESS) {
+        smart_str_free(&buf);
+        zval_ptr_dtor(&arr);
+        return "";
+    }
+    smart_str_0(&buf);
+    std::string result;
+    if (buf.s != nullptr) {
+        result.assign(ZSTR_VAL(buf.s), ZSTR_LEN(buf.s));
+    }
+    smart_str_free(&buf);
+    zval_ptr_dtor(&arr);
+    return result;
 }
 
 #ifdef KISLAYPHP_RPC
@@ -333,6 +516,21 @@ typedef struct _php_kislay_socket_server_t {
     zval auth_handler;
     bool has_auth_handler;
     std::unordered_map<std::string, zval> ack_handlers;
+
+    /* Redis pub/sub adapter for horizontal scaling */
+    bool redis_enabled;
+    std::string redis_host;
+    int redis_port;
+    std::string redis_channel_prefix;
+    int redis_pub_fd;
+    std::mutex redis_pub_lock;
+    std::thread redis_sub_thread;
+    std::atomic<bool> redis_sub_running{false};
+    /* Written from kislay_redis_sub_thread_func on the subscriber thread and
+     * read/written from the destructor thread (to close(2) it and unblock
+     * the subscriber thread's blocking recv/poll) - a plain int here is an
+     * unsynchronized data race between those two threads. */
+    std::atomic<int> redis_sub_fd{-1};
 } php_kislay_socket_server_t;
 
 typedef struct _php_kislay_socket_client_t {
@@ -433,6 +631,18 @@ static zend_object *kislay_socket_server_create_object(zend_class_entry *ce) {
         server->transports.insert("polling");
         server->transports.insert("websocket");
     }
+
+    /* Redis pub/sub adapter — disabled until setRedis() is called */
+    server->redis_enabled = false;
+    new (&server->redis_host) std::string("127.0.0.1");
+    server->redis_port = 6379;
+    new (&server->redis_channel_prefix) std::string("kislay:socket:");
+    server->redis_pub_fd = -1;
+    new (&server->redis_pub_lock) std::mutex();
+    new (&server->redis_sub_thread) std::thread();
+    new (&server->redis_sub_running) std::atomic<bool>(false);
+    new (&server->redis_sub_fd) std::atomic<int>(-1);
+
     server->std.handlers = &kislay_socket_server_handlers;
     return &server->std;
 }
@@ -457,6 +667,24 @@ static void kislay_socket_server_free_obj(zend_object *object) {
             zval_ptr_dtor(&session.second.pending.payload);
         }
     }
+    /* Stop Redis subscriber thread before any other cleanup */
+    if (server->redis_sub_running.load()) {
+        server->redis_sub_running.store(false);
+        int sub_fd = server->redis_sub_fd.load();
+        if (sub_fd >= 0) {
+            ::shutdown(sub_fd, SHUT_RDWR);
+            ::close(sub_fd);
+            server->redis_sub_fd.store(-1);
+        }
+        if (server->redis_sub_thread.joinable()) {
+            server->redis_sub_thread.join();
+        }
+    }
+    if (server->redis_pub_fd >= 0) {
+        ::close(server->redis_pub_fd);
+        server->redis_pub_fd = -1;
+    }
+
     server->sessions.~unordered_map();
     server->rooms.~unordered_map();
     server->conn_to_sid.~unordered_map();
@@ -468,6 +696,12 @@ static void kislay_socket_server_free_obj(zend_object *object) {
     server->auth_query_keys.~vector();
     server->auth_header_keys.~vector();
     server->transports.~unordered_set();
+    server->redis_host.~basic_string();
+    server->redis_channel_prefix.~basic_string();
+    server->redis_pub_lock.~mutex();
+    server->redis_sub_thread.~thread();
+    server->redis_sub_running.~atomic();
+    server->redis_sub_fd.~atomic();
     server->lock.~mutex();
     server->cv.~condition_variable();
     server->counter.~atomic();
@@ -781,21 +1015,46 @@ static bool kislay_send_socketio_event(php_kislay_socket_server_t *server, const
     return true;
 }
 
-static void kislay_broadcast(php_kislay_socket_server_t *server, const std::string &event, zval *data) {
+/* skip_redis: set to true when called from the Redis subscriber thread to
+ * avoid re-publishing messages that originated from another node. */
+static void kislay_broadcast(php_kislay_socket_server_t *server, const std::string &event, zval *data, bool skip_redis = false) {
     for (const auto &entry : server->clients) {
         kislay_send_socketio_event(server, entry.first, event, data);
     }
+    if (!skip_redis && server->redis_enabled && server->redis_pub_fd >= 0) {
+        std::string payload = kislay_redis_make_payload(event, data);
+        if (!payload.empty()) {
+            std::string channel = server->redis_channel_prefix + "broadcast";
+            kislay_redis_publish(server->redis_pub_fd, server->redis_pub_lock, channel, payload);
+        }
+    }
 }
 
-static void kislay_emit_room(php_kislay_socket_server_t *server, const std::string &room, const std::string &event, zval *data) {
+static void kislay_emit_room(php_kislay_socket_server_t *server, const std::string &room, const std::string &event, zval *data, bool skip_redis = false) {
     auto it = server->rooms.find(room);
     if (it == server->rooms.end()) {
+        /* Still publish to Redis even if we have no local subscribers — other
+         * nodes may have members in this room. */
+        if (!skip_redis && server->redis_enabled && server->redis_pub_fd >= 0) {
+            std::string payload = kislay_redis_make_payload(event, data);
+            if (!payload.empty()) {
+                std::string channel = server->redis_channel_prefix + "room:" + room;
+                kislay_redis_publish(server->redis_pub_fd, server->redis_pub_lock, channel, payload);
+            }
+        }
         return;
     }
     for (const auto &sid : it->second) {
         auto cit = server->clients.find(sid);
         if (cit != server->clients.end()) {
             kislay_send_socketio_event(server, cit->first, event, data);
+        }
+    }
+    if (!skip_redis && server->redis_enabled && server->redis_pub_fd >= 0) {
+        std::string payload = kislay_redis_make_payload(event, data);
+        if (!payload.empty()) {
+            std::string channel = server->redis_channel_prefix + "room:" + room;
+            kislay_redis_publish(server->redis_pub_fd, server->redis_pub_lock, channel, payload);
         }
     }
 }
@@ -1650,6 +1909,181 @@ static void kislay_ws_close_handler(const struct mg_connection *conn, void *cbda
     kislay_run_pending_calls(server, pending);
 }
 
+/* ─────────────────────────────────────────────────────────────────────────
+ * Redis subscriber thread
+ * Uses PSUBSCRIBE to match "{prefix}room:*" and "{prefix}broadcast"
+ * so a single subscription covers all room channels and the broadcast
+ * channel without needing to enumerate them.
+ * ───────────────────────────────────────────────────────────────────────── */
+static void kislay_redis_sub_thread_func(php_kislay_socket_server_t *server) {
+    const std::string &host   = server->redis_host;
+    int                port   = server->redis_port;
+    const std::string &prefix = server->redis_channel_prefix;
+
+    while (server->redis_sub_running.load()) {
+        int fd = kislay_redis_connect(host, port);
+        if (fd < 0) {
+            /* Back off before retrying */
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            continue;
+        }
+
+        server->redis_sub_fd = fd;
+
+        /* PSUBSCRIBE {prefix}room:* {prefix}broadcast */
+        std::string pat_room      = prefix + "room:*";
+        std::string pat_broadcast = prefix + "broadcast";
+        if (!kislay_redis_send_command(fd, {"PSUBSCRIBE", pat_room, pat_broadcast})) {
+            ::close(fd);
+            server->redis_sub_fd = -1;
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            continue;
+        }
+
+        /* Set when the connection is dead (real error/EOF, or a malformed/
+         * desynced RESP frame we can't safely resync from) and the message
+         * loop below should stop and fall through to the outer reconnect. */
+        bool connection_dead = false;
+
+        /* Message loop — runs until redis_sub_running is false or connection drops */
+        while (server->redis_sub_running.load() && !connection_dead) {
+            /* Each PSUBSCRIBE confirmation / pmessage begins with *N\r\n */
+            std::string line;
+            bool timed_out = false;
+            if (!kislay_redis_read_line(fd, line, 500, &timed_out)) {
+                if (!server->redis_sub_running.load()) { break; }
+                if (timed_out) {
+                    /* Nothing to read yet - perfectly normal, keep polling. */
+                    continue;
+                }
+                /* Real error/EOF: the fd is dead. Break out to the outer
+                 * loop's close+backoff+reconnect instead of busy-spinning
+                 * poll() on a socket that will never produce data again. */
+                connection_dead = true;
+                break;
+            }
+
+            if (line.empty() || line[0] != '*') { continue; }
+
+            /* The rest of this iteration parses a RESP array using stoi() on
+             * bytes read straight off the wire. A malformed/desynced frame
+             * here (which should never happen against a well-behaved Redis,
+             * but previously was NOT guarded against) throws
+             * std::invalid_argument/std::out_of_range - uncaught, that's
+             * std::terminate() on this thread, i.e. the whole process dies
+             * instantly. Treat any such failure as a dead connection instead
+             * of letting it escape, since a byte-level RESP desync can't be
+             * safely resumed mid-stream anyway - only a fresh reconnect +
+             * PSUBSCRIBE can restore a known-good framing state. */
+            bool ok = true;
+            std::vector<std::string> parts;
+            try {
+                long nparts_l = std::stol(line.substr(1));
+                if (nparts_l < 0 || nparts_l > 64) {
+                    /* Not a plausible pub/sub reply shape - desynced. */
+                    ok = false;
+                } else {
+                    int nparts = static_cast<int>(nparts_l);
+                    parts.reserve(static_cast<size_t>(nparts));
+                    for (int i = 0; i < nparts && ok; ++i) {
+                        std::string hdr;
+                        if (!kislay_redis_read_line(fd, hdr, 2000)) { ok = false; break; }
+                        if (hdr.empty()) { ok = false; break; }
+
+                        if (hdr[0] == '$') {
+                            long blen = std::stol(hdr.substr(1));
+                            if (blen > (16 * 1024 * 1024)) { ok = false; break; } /* sanity cap */
+                            std::string bulk;
+                            if (!kislay_redis_read_bulk(fd, static_cast<int>(blen), bulk, 2000)) { ok = false; break; }
+                            parts.push_back(std::move(bulk));
+                        } else if (hdr[0] == ':') {
+                            parts.push_back(hdr.substr(1));
+                        } else if (hdr[0] == '+') {
+                            parts.push_back(hdr.substr(1));
+                        } else {
+                            ok = false; break;
+                        }
+                    }
+                }
+            } catch (const std::exception &) {
+                ok = false;
+            }
+
+            if (!ok) {
+                connection_dead = true;
+                break;
+            }
+            if (parts.empty()) { continue; }
+
+            /* psubscribe confirmation: ["psubscribe", pattern, count] — skip */
+            if (parts[0] == "psubscribe" || parts[0] == "punsubscribe") {
+                continue;
+            }
+
+            /* pmessage: ["pmessage", pattern, channel, payload] */
+            if (parts[0] == "pmessage" && parts.size() == 4) {
+                const std::string &channel = parts[2];
+                const std::string &payload = parts[3];
+
+                // This whole block runs on the Redis subscriber thread, a
+                // second (and separate from the civetweb worker) non-script
+                // thread touching Zend (php_json_decode below, plus
+                // php_json_encode inside kislay_send_socketio_event via
+                // kislay_broadcast/kislay_emit_room) - see
+                // kislay_socket_php_call_lock.
+                std::lock_guard<std::recursive_mutex> php_guard(kislay_socket_php_call_lock);
+
+                /* Decode JSON payload {"event":"...", "data":<json>} */
+                zval decoded;
+                if (php_json_decode(&decoded,
+                                    payload.c_str(),
+                                    static_cast<size_t>(payload.size()),
+                                    true,
+                                    PHP_JSON_PARSER_DEFAULT_DEPTH) != SUCCESS) {
+                    continue;
+                }
+                if (Z_TYPE(decoded) != IS_ARRAY) {
+                    zval_ptr_dtor(&decoded);
+                    continue;
+                }
+
+                zval *ev_val = zend_hash_str_find(Z_ARRVAL(decoded), "event", sizeof("event") - 1);
+                zval *data_val = zend_hash_str_find(Z_ARRVAL(decoded), "data", sizeof("data") - 1);
+                if (ev_val == nullptr || Z_TYPE_P(ev_val) != IS_STRING) {
+                    zval_ptr_dtor(&decoded);
+                    continue;
+                }
+
+                std::string event(Z_STRVAL_P(ev_val), Z_STRLEN_P(ev_val));
+
+                bool is_broadcast = (channel == pat_broadcast);
+                std::string room;
+                if (!is_broadcast) {
+                    /* channel = "{prefix}room:{roomname}" */
+                    size_t room_offset = prefix.size() + 5; /* "room:" is 5 chars */
+                    if (channel.size() > room_offset) {
+                        room = channel.substr(room_offset);
+                    }
+                }
+
+                {
+                    std::lock_guard<std::mutex> guard(server->lock);
+                    if (is_broadcast) {
+                        kislay_broadcast(server, event, data_val, /* skip_redis= */ true);
+                    } else if (!room.empty()) {
+                        kislay_emit_room(server, room, event, data_val, /* skip_redis= */ true);
+                    }
+                }
+
+                zval_ptr_dtor(&decoded);
+            }
+        }
+
+        ::close(fd);
+        server->redis_sub_fd = -1;
+    }
+}
+
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislay_socket_void, 0, 0, 0)
 ZEND_END_ARG_INFO()
 
@@ -1710,12 +2144,52 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_kislay_socket_namespace, 0, 0, 1)
     ZEND_ARG_TYPE_INFO(0, ns, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislay_socket_set_redis, 0, 0, 1)
+    ZEND_ARG_TYPE_INFO(0, host, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, port, IS_LONG, 1)
+    ZEND_ARG_TYPE_INFO(0, prefix, IS_STRING, 1)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislay_ack_invoke, 0, 0, 0)
     ZEND_ARG_INFO(0, data)
 ZEND_END_ARG_INFO()
 
 PHP_METHOD(KislaySocketServer, __construct) {
     ZEND_PARSE_PARAMETERS_NONE();
+}
+
+PHP_METHOD(KislaySocketServer, setRedis) {
+    char *host = nullptr;
+    size_t host_len = 0;
+    zend_long port = 6379;
+    char *prefix = nullptr;
+    size_t prefix_len = 0;
+    ZEND_PARSE_PARAMETERS_START(1, 3)
+        Z_PARAM_STRING(host, host_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(port)
+        Z_PARAM_STRING(prefix, prefix_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (port <= 0 || port > 65535) {
+        zend_throw_exception(zend_ce_exception, "Invalid Redis port", 0);
+        RETURN_FALSE;
+    }
+
+    php_kislay_socket_server_t *server = php_kislay_socket_server_from_obj(Z_OBJ_P(getThis()));
+    if (server->ctx != nullptr) {
+        zend_throw_exception(zend_ce_exception, "Cannot call setRedis() after listen()", 0);
+        RETURN_FALSE;
+    }
+
+    std::lock_guard<std::mutex> guard(server->lock);
+    server->redis_host.assign(host, host_len);
+    server->redis_port = static_cast<int>(port);
+    if (prefix != nullptr && prefix_len > 0) {
+        server->redis_channel_prefix.assign(prefix, prefix_len);
+    }
+    server->redis_enabled = true;
+    RETURN_TRUE;
 }
 
 PHP_METHOD(KislaySocketServer, on) {
@@ -1901,6 +2375,16 @@ PHP_METHOD(KislaySocketServer, listen) {
                              kislay_ws_data_handler,
                              kislay_ws_close_handler,
                              server);
+
+    /* Start Redis pub/sub adapter if configured */
+    if (server->redis_enabled) {
+        server->redis_pub_fd = kislay_redis_connect(server->redis_host, server->redis_port);
+        /* Non-fatal: pub fd may be -1 if Redis is not yet reachable; publish
+         * calls will silently skip until it reconnects (future enhancement). */
+
+        server->redis_sub_running.store(true);
+        server->redis_sub_thread = std::thread(kislay_redis_sub_thread_func, server);
+    }
 
     server->running = true;
     while (server->running) {
@@ -2404,6 +2888,7 @@ static const zend_function_entry kislay_socket_server_methods[] = {
     PHP_ME(KislaySocketServer, getClients, arginfo_kislay_socket_get_clients, ZEND_ACC_PUBLIC)
     PHP_ME(KislaySocketServer, setMaxPayload, arginfo_kislay_socket_set_max_payload, ZEND_ACC_PUBLIC)
     PHP_ME(KislaySocketServer, namespace, arginfo_kislay_socket_namespace, ZEND_ACC_PUBLIC)
+    PHP_ME(KislaySocketServer, setRedis, arginfo_kislay_socket_set_redis, ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 
