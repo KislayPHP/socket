@@ -667,14 +667,22 @@ static void kislay_socket_server_free_obj(zend_object *object) {
             zval_ptr_dtor(&session.second.pending.payload);
         }
     }
-    /* Stop Redis subscriber thread before any other cleanup */
+    /* Stop Redis subscriber thread before any other cleanup.
+     * kislay_redis_sub_thread_func is the sole owner of redis_sub_fd's
+     * open/close lifecycle - it always closes what it opens, on its own
+     * thread, once it observes redis_sub_running == false. We only
+     * shutdown() the fd here (never close() it) to force its blocking
+     * recv/poll to return immediately instead of waiting out a timeout;
+     * shutdown() is safe to race with the owning thread's own close()
+     * since it doesn't release the fd number. If we closed it here too,
+     * both threads would end up calling close() on the same fd value -
+     * and if some other thread opens a new fd in between, the second
+     * close() silently tears down an unrelated resource instead. */
     if (server->redis_sub_running.load()) {
         server->redis_sub_running.store(false);
         int sub_fd = server->redis_sub_fd.load();
         if (sub_fd >= 0) {
             ::shutdown(sub_fd, SHUT_RDWR);
-            ::close(sub_fd);
-            server->redis_sub_fd.store(-1);
         }
         if (server->redis_sub_thread.joinable()) {
             server->redis_sub_thread.join();
