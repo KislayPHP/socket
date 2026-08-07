@@ -111,6 +111,7 @@ Legacy `KISLAYPHP_EVENTBUS_*` and `KISLAYPHP_AUTH_*` environment variables are s
 - no durable message history
 - no multi-node transport bridge in this package yet
 - at this stage, treat it as the socket transport layer, not as a durable event platform
+- **do not load `socket` together with `core` and/or `gateway` in the same PHP process.** All three vendor their own copy of civetweb and export non-static symbols like `mg_start`; on platforms linking extensions with `-flat_namespace` (notably macOS), combining any two of them risks one's compiled civetweb code silently shadowing another's, with no error - just undefined behavior up to and including crashes. Run socket as its own process (e.g. behind gateway, or alongside core's process rather than inside it).
 
 ## Positioning
 
