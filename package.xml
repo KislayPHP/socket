@@ -14,17 +14,17 @@
     <email>kislayraj.89@gmail.com</email>
     <active>yes</active>
   </lead>
-  <date>2026-03-16</date>
+  <date>2026-08-08</date>
   <version>
-    <release>0.0.1</release>
-    <api>0.0.1</api>
+    <release>1.0.0</release>
+    <api>1.0.0</api>
   </version>
   <stability>
     <release>beta</release>
     <api>beta</api>
   </stability>
   <license>Apache-2.0</license>
-  <notes>Initial standalone socket transport release.</notes>
+  <notes>Release 1.0.0 (first stable-milestone tag): native WebSocket transport, Redis pub/sub relay, event-driven on()/onAuth()/join() callbacks with Zend-safety serialization, cross-extension civetweb symbol isolation, fixed a 100%-reproducible onAuth() null-pointer crash.</notes>
   <contents>
     <dir name="/">
       <file name="*" role="src" />

@@ -1,6 +1,6 @@
 {
   "name": "kislayphp_socket",
-  "version": "0.0.1",
+  "version": "1.0.0",
   "description": "Node-side helpers and assets for the Kislay Socket transport package.",
   "main": "index.js",
   "scripts": {
