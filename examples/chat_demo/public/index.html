@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>KislayPHP Socket — Chat Demo</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<main>
+    <h1>Kislay\Socket\Server chat demo</h1>
+    <p class="subtitle">Event-driven: on('connection')/on('join_room')/on('chat_message')/on('disconnect'), room-scoped via $client-&gt;join()/emitTo().</p>
+    <p class="subtitle">Single-client only — the server can service one connection at a time (see README). Opening a 2nd tab will hang on "connecting…" until this one closes.</p>
+    <span id="status" class="status-pending">connecting…</span>
+
+    <form id="room-form">
+        <input id="room-input" type="text" placeholder="room name (default: lobby)" autocomplete="off">
+        <button type="submit">Join</button>
+    </form>
+
+    <div id="room-info">
+        <span>Room members</span>
+        <span id="user-count">0</span>
+    </div>
+
+    <ul id="messages"></ul>
+
+    <form id="chat-form">
+        <input id="chat-input" type="text" placeholder="Type a message…" autocomplete="off">
+        <button type="submit" disabled>Send</button>
+    </form>
+</main>
+<script>
+    window.CHAT_SOCKET_HOST = location.hostname || '127.0.0.1';
+    window.CHAT_SOCKET_PORT = 9200;
+</script>
+<script src="app.js"></script>
+</body>
+</html>
