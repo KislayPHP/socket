@@ -55,6 +55,7 @@ start_proc "web" \
 
 echo
 echo "Chat demo ready:"
-echo "  Open http://${WEB_HOST}:${WEB_PORT} in a browser (open it twice to see room presence/chat live)"
+echo "  Open http://${WEB_HOST}:${WEB_PORT} in a browser"
 echo "  Socket server on ${SOCKET_HOST}:${SOCKET_PORT}"
+echo "  Single-client only (see README 'Known limitations') - a 2nd tab will hang until the 1st closes"
 echo "  Stop with ./stop.sh"
