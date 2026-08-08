@@ -1258,7 +1258,6 @@ static void kislay_run_pending_calls(php_kislay_socket_server_t *server,
             for (const auto &kv : call.handshake_headers) {
                 add_assoc_string(&headers_arr, kv.first.c_str(), kv.second.c_str());
             }
-            add_assoc_zval(&handshake, "path", nullptr); // placeholder
             zval path_val; ZVAL_STRING(&path_val, call.handshake_path.c_str());
             zend_hash_str_update(Z_ARRVAL(handshake), "path", sizeof("path")-1, &path_val);
             add_assoc_zval(&handshake, "query", &query_arr);
