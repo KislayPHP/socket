@@ -878,20 +878,28 @@ static std::vector<std::string> kislay_engineio_parse_payload(const char *data, 
 }
 
 // Every Zend/PHP API touched from a civetweb I/O thread or the Redis
-// subscriber thread happens off the original PHP script thread (which is
-// parked inside listen()). On NTS builds there's no TSRM/per-thread Zend
-// engine isolation - calling into Zend from a thread with no
-// synchronization relative to whichever thread last touched it is a data
-// race at the C++ memory-model level (no happens-before edge for
-// zend_mm/executor_globals state), and reliably corrupts the heap
-// (zend_mm_panic) - not just from concurrent user callback invocations, but
-// from ANY Zend call (php_json_decode, zval construction/destruction, etc)
-// made from more than one such thread. Core's own dedicated-thread PHP
-// execution (PhpRuntimePool::worker_main, core/src/runtime/php_runtime.cpp)
-// has the identical shape and serializes every such call through a single
-// mutex (nts_lock_) for exactly this reason. This mirrors that, as a
-// recursive mutex since call sites nest (e.g. kislay_call_php is invoked
-// from within an already-locked packet-handling scope).
+// subscriber thread happens off the original PHP script thread. CORRECTION
+// (2026-08-12): that original thread is NOT "parked inside listen()" as
+// this comment used to claim - listen() returns, and the calling script's
+// own housekeeping loop (below, in this same PHP_METHOD) keeps running on
+// it, waking up every 1000ms to check ping/pong timeouts and itself making
+// Zend calls (via kislay_queue_event_locked()/kislay_run_pending_calls() on
+// a timed-out session). That's a third thread this lock has to serialize
+// against, not just the two named above - see the lock-order-inversion fix
+// in the housekeeping loop itself for a bug this caused. On NTS builds
+// there's no TSRM/per-thread Zend engine isolation - calling into Zend from
+// a thread with no synchronization relative to whichever thread last
+// touched it is a data race at the C++ memory-model level (no
+// happens-before edge for zend_mm/executor_globals state), and reliably
+// corrupts the heap (zend_mm_panic) - not just from concurrent user
+// callback invocations, but from ANY Zend call (php_json_decode, zval
+// construction/destruction, etc) made from more than one such thread.
+// Core's own dedicated-thread PHP execution (PhpRuntimePool::worker_main,
+// core/src/runtime/php_runtime.cpp) has the identical shape and serializes
+// every such call through a single mutex (nts_lock_) for exactly this
+// reason. This mirrors that, as a recursive mutex since call sites nest
+// (e.g. kislay_call_php is invoked from within an already-locked
+// packet-handling scope).
 static std::recursive_mutex kislay_socket_php_call_lock;
 
 static bool kislay_call_php(zval *callable, uint32_t argc, zval *argv, zval *retval) {
@@ -2420,6 +2428,7 @@ PHP_METHOD(KislaySocketServer, listen) {
     server->running = true;
     while (server->running) {
         std::vector<kislay_pending_call> pending;
+        std::vector<std::string> timed_out;
         {
             std::lock_guard<std::mutex> guard(server->lock);
             auto now = std::chrono::steady_clock::now();
@@ -2439,6 +2448,23 @@ PHP_METHOD(KislaySocketServer, listen) {
                 }
             }
 
+            // FIXED (2026-08-12, see memory socket_websocket_crash_fix.md):
+            // kislay_queue_event_locked() used to be called from inside this
+            // same server->lock scope - it internally acquires
+            // kislay_socket_php_call_lock, so that made server->lock the
+            // OUTER lock and php_call_lock the INNER one here, the exact
+            // reverse of every other call site in this file (which always
+            // acquire php_call_lock first, server->lock second, or never
+            // hold server->lock at all when calling into it - see the
+            // "Acquired before server->lock, always in this order" comments
+            // elsewhere). A genuine, previously-undocumented lock-order
+            // inversion between this housekeeping loop (which runs on the
+            // main PHP script thread every 1000ms - NOT parked inside
+            // listen() as an older comment nearby claimed) and every
+            // civetweb/Redis-thread call site. Now: only the non-Zend
+            // cleanup (packet send, map erasure) happens under server->lock;
+            // the sid is collected into timed_out and kislay_queue_event_locked
+            // is called after the lock is released, below.
             for (const auto &sid : expired) {
                 auto sit = server->sessions.find(sid);
                 if (sit == server->sessions.end()) {
@@ -2448,11 +2474,14 @@ PHP_METHOD(KislaySocketServer, listen) {
                 if (sit->second.ws_conn != nullptr) {
                     server->conn_to_sid.erase(sit->second.ws_conn);
                 }
-                kislay_queue_event_locked(server, sid, "disconnect", nullptr, pending);
                 kislay_remove_client(server, sid);
                 kislay_clear_pending(sit->second.pending);
                 server->sessions.erase(sit);
+                timed_out.push_back(sid);
             }
+        }
+        for (const auto &sid : timed_out) {
+            kislay_queue_event_locked(server, sid, "disconnect", nullptr, pending);
         }
         kislay_run_pending_calls(server, pending);
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
