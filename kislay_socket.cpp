@@ -459,8 +459,10 @@ struct kislay_socket_pending_binary {
     bool active;
     int expected;
     int received;
-    std::string event;
-    zval payload;
+    /* Original triggering packet bytes (e.g. "5<N>-[...]"), re-parsed into a
+     * zval only once this reaches kislay_process_raw_events() on the main
+     * thread - see kislay_raw_event below for why. */
+    std::string raw_packet;
     std::vector<std::string> binaries;
 };
 
@@ -490,6 +492,41 @@ struct kislay_pending_call {
     std::unordered_map<std::string, std::string> handshake_headers;
 };
 
+/* Plain-data work item pushed by civetweb worker threads and the Redis
+ * subscriber thread. Deliberately contains NO zval/zend_string/any
+ * Zend-owned type - see the long comment above kislay_socket_php_call_lock's
+ * old definition (kept nearby) for why: every prior fix that still allowed
+ * Zend to be touched from more than one OS thread (even under a mutex that
+ * fully serializes access) left the disassembly-confirmed ZEND_CONCAT/
+ * zend_string_alloc UAF unresolved. kislay_process_raw_events(), called
+ * exclusively from the single main thread running Server::listen()'s
+ * housekeeping loop, is now the ONLY place in this file that ever touches
+ * Zend for these events - it turns a raw_event into the zval-bearing
+ * kislay_pending_call above and dispatches it. */
+struct kislay_raw_event {
+    enum class Kind { Dispatch, RedisMessage };
+    Kind kind = Kind::Dispatch;
+
+    /* Kind::Dispatch */
+    std::string sid;
+    /* Pre-known event name (e.g. "connection"/"disconnect", determined by
+     * pure byte-level engine.io framing with no JSON involved). Left empty
+     * when raw_packet must still be JSON-parsed on the main thread to learn
+     * the event name (ordinary/binary-completion EVENT packets). */
+    std::string event;
+    std::string raw_packet;
+    std::vector<std::string> binaries;
+    bool is_binary_completion = false;
+    bool has_handshake = false;
+    std::string handshake_path;
+    std::string handshake_query_string;
+    std::unordered_map<std::string, std::string> handshake_headers;
+
+    /* Kind::RedisMessage */
+    std::string redis_channel;
+    std::string redis_payload;
+};
+
 typedef struct _php_kislay_socket_server_t {
     zend_object std;
     struct mg_context *ctx;
@@ -501,6 +538,15 @@ typedef struct _php_kislay_socket_server_t {
     std::unordered_map<std::string, kislay_socket_session> sessions;
     std::mutex lock;
     std::condition_variable cv;
+    /* Work queue for kislay_raw_event, filled by civetweb worker threads and
+     * the Redis subscriber thread, drained ONLY by the main thread inside
+     * Server::listen()'s housekeeping loop. Guarded by `lock` (the same
+     * mutex protecting sessions/clients/rooms - this queue is plain C++ data,
+     * never a Zend touch, so sharing the mutex is safe and avoids yet another
+     * lock to reason about). `work_cv` wakes the housekeeping loop promptly
+     * instead of waiting up to 1000ms. */
+    std::vector<kislay_raw_event> raw_event_queue;
+    std::condition_variable work_cv;
     std::atomic<uint64_t> counter;
     bool running;
     bool auth_enabled;
@@ -592,6 +638,8 @@ static zend_object *kislay_socket_server_create_object(zend_class_entry *ce) {
     new (&server->sessions) std::unordered_map<std::string, kislay_socket_session>();
     new (&server->lock) std::mutex();
     new (&server->cv) std::condition_variable();
+    new (&server->raw_event_queue) std::vector<kislay_raw_event>();
+    new (&server->work_cv) std::condition_variable();
     new (&server->counter) std::atomic<uint64_t>(0);
     server->ctx = nullptr;
     server->running = false;
@@ -662,11 +710,8 @@ static void kislay_socket_server_free_obj(zend_object *object) {
         mg_stop(server->ctx);
         server->ctx = nullptr;
     }
-    for (auto &session : server->sessions) {
-        if (session.second.pending.active) {
-            zval_ptr_dtor(&session.second.pending.payload);
-        }
-    }
+    /* session.pending no longer holds a zval (see kislay_socket_pending_binary) -
+     * nothing to release here. */
     /* Stop Redis subscriber thread before any other cleanup.
      * kislay_redis_sub_thread_func is the sole owner of redis_sub_fd's
      * open/close lifecycle - it always closes what it opens, on its own
@@ -712,6 +757,8 @@ static void kislay_socket_server_free_obj(zend_object *object) {
     server->redis_sub_fd.~atomic();
     server->lock.~mutex();
     server->cv.~condition_variable();
+    server->raw_event_queue.~vector();
+    server->work_cv.~condition_variable();
     server->counter.~atomic();
     zend_object_std_dtor(&server->std);
 }
@@ -966,13 +1013,10 @@ static std::string kislay_build_open_packet(const std::string &sid,
 }
 
 static void kislay_clear_pending(kislay_socket_pending_binary &pending) {
-    if (pending.active) {
-        zval_ptr_dtor(&pending.payload);
-    }
     pending.active = false;
     pending.expected = 0;
     pending.received = 0;
-    pending.event.clear();
+    pending.raw_packet.clear();
     pending.binaries.clear();
 }
 
@@ -1084,7 +1128,12 @@ static void kislay_emit_room(php_kislay_socket_server_t *server, const std::stri
         }
         return;
     }
+    std::vector<std::string> recipients;
+    recipients.reserve(it->second.size());
     for (const auto &sid : it->second) {
+        recipients.push_back(sid);
+    }
+    for (const auto &sid : recipients) {
         auto cit = server->clients.find(sid);
         if (cit != server->clients.end()) {
             kislay_send_socketio_event(server, cit->first, event, data);
@@ -1353,11 +1402,72 @@ static void kislay_remove_client(php_kislay_socket_server_t *server, const std::
     server->clients.erase(client_it);
 }
 
+/* Pure byte-level base64 decode - deliberately NOT php_base64_decode_ex(),
+ * which allocates a zend_string and is therefore unsafe to call from a
+ * civetweb worker thread. See the kislay_raw_event comment for why nothing
+ * Zend-owned may be touched off the main thread. */
+static std::string kislay_base64_decode_raw(const char *data, size_t len) {
+    static const std::string alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    static int8_t rev[256];
+    static bool rev_init = false;
+    if (!rev_init) {
+        for (int i = 0; i < 256; ++i) { rev[i] = -1; }
+        for (size_t i = 0; i < alphabet.size(); ++i) {
+            rev[static_cast<unsigned char>(alphabet[i])] = static_cast<int8_t>(i);
+        }
+        rev_init = true;
+    }
+
+    std::string out;
+    out.reserve((len / 4) * 3 + 3);
+    int val = 0;
+    int bits = -8;
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = static_cast<unsigned char>(data[i]);
+        if (c == '=') { break; }
+        int8_t d = rev[c];
+        if (d == -1) { continue; }
+        val = (val << 6) + d;
+        bits += 6;
+        if (bits >= 0) {
+            out.push_back(static_cast<char>((val >> bits) & 0xFF));
+            bits -= 8;
+        }
+    }
+    return out;
+}
+
+/* Pure byte-level prescan of a BINARY_EVENT packet's attachment count
+ * ("5<N>-[...]"), duplicating just the non-JSON prefix of
+ * kislay_parse_socketio_event_packet()'s own scan below - deliberately NOT
+ * calling that function here, since it invokes php_json_decode() and must
+ * only ever run on the main thread. Returns 0 if not a well-formed
+ * BINARY_EVENT prefix (including zero attachments), matching the
+ * `is_binary && attachments > 0` gate this replaces. */
+static int kislay_prescan_binary_attachment_count(const std::string &packet) {
+    if (packet.empty() || packet[0] != '5') {
+        return 0;
+    }
+    size_t offset = 1;
+    int attachments = 0;
+    bool any_digit = false;
+    while (offset < packet.size() && packet[offset] >= '0' && packet[offset] <= '9') {
+        attachments = attachments * 10 + (packet[offset] - '0');
+        offset++;
+        any_digit = true;
+    }
+    if (!any_digit || offset >= packet.size() || packet[offset] != '-') {
+        return 0;
+    }
+    return attachments;
+}
+
 static void kislay_handle_socketio_packet(php_kislay_socket_server_t *server,
                                           const std::string &sid,
                                           kislay_socket_session &session,
                                           const std::string &packet,
-                                          std::vector<kislay_pending_call> &pending) {
+                                          std::vector<kislay_raw_event> &raw_events) {
     if (packet.empty()) {
         return;
     }
@@ -1371,16 +1481,24 @@ static void kislay_handle_socketio_packet(php_kislay_socket_server_t *server,
             server->clients.emplace(sid, state);
         }
         kislay_send_socketio_packet(server, sid, "0");
-        {
-            auto sit = server->sessions.find(sid);
-            const kislay_socket_session *sptr = (sit != server->sessions.end()) ? &sit->second : nullptr;
-            kislay_queue_event_locked(server, sid, "connection", nullptr, pending, sptr);
-        }
+        kislay_raw_event ev;
+        ev.kind = kislay_raw_event::Kind::Dispatch;
+        ev.sid = sid;
+        ev.event = "connection";
+        ev.has_handshake = true;
+        ev.handshake_path = session.handshake_path;
+        ev.handshake_query_string = session.handshake_query_string;
+        ev.handshake_headers = session.handshake_headers;
+        raw_events.push_back(std::move(ev));
         return;
     }
 
     if (type == '1') {
-        kislay_queue_event_locked(server, sid, "disconnect", nullptr, pending);
+        kislay_raw_event ev;
+        ev.kind = kislay_raw_event::Kind::Dispatch;
+        ev.sid = sid;
+        ev.event = "disconnect";
+        raw_events.push_back(std::move(ev));
         kislay_remove_client(server, sid);
         return;
     }
@@ -1389,42 +1507,27 @@ static void kislay_handle_socketio_packet(php_kislay_socket_server_t *server,
         return;
     }
 
-    std::string event;
-    zval payload;
-    ZVAL_UNDEF(&payload);
-    int attachments = 0;
-    bool is_binary = false;
-
-    if (!kislay_parse_socketio_event_packet(packet.data(), packet.size(), event, &payload, &attachments, &is_binary)) {
-        if (!Z_ISUNDEF(payload)) {
-            zval_ptr_dtor(&payload);
+    if (type == '5') {
+        int attachments = kislay_prescan_binary_attachment_count(packet);
+        if (attachments > 0) {
+            kislay_clear_pending(session.pending);
+            session.pending.active = true;
+            session.pending.expected = attachments;
+            session.pending.received = 0;
+            session.pending.raw_packet = packet;
+            return; /* wait for the binary WS frames that follow */
         }
-        return;
     }
 
-    if (is_binary && attachments > 0) {
-        kislay_clear_pending(session.pending);
-        session.pending.active = true;
-        session.pending.expected = attachments;
-        session.pending.received = 0;
-        session.pending.event = event;
-        if (Z_ISUNDEF(payload)) {
-            ZVAL_NULL(&session.pending.payload);
-        } else {
-            ZVAL_COPY(&session.pending.payload, &payload);
-        }
-        if (!Z_ISUNDEF(payload)) {
-            zval_ptr_dtor(&payload);
-        }
-        return;
-    }
-
-    if (!Z_ISUNDEF(payload)) {
-        kislay_queue_event_locked(server, sid, event, &payload, pending);
-        zval_ptr_dtor(&payload);
-    } else {
-        kislay_queue_event_locked(server, sid, event, nullptr, pending);
-    }
+    /* Plain EVENT, or a malformed/zero-attachment BINARY_EVENT header - the
+     * main thread (kislay_process_raw_events) JSON-decodes raw_packet and
+     * learns the real event name there, exactly as this function used to do
+     * inline via kislay_parse_socketio_event_packet(). */
+    kislay_raw_event ev;
+    ev.kind = kislay_raw_event::Kind::Dispatch;
+    ev.sid = sid;
+    ev.raw_packet = packet;
+    raw_events.push_back(std::move(ev));
 }
 
 static void kislay_handle_socketio_binary(php_kislay_socket_server_t *server,
@@ -1432,7 +1535,8 @@ static void kislay_handle_socketio_binary(php_kislay_socket_server_t *server,
                                           kislay_socket_session &session,
                                           const char *data,
                                           size_t data_len,
-                                          std::vector<kislay_pending_call> &pending) {
+                                          std::vector<kislay_raw_event> &raw_events) {
+    (void)server;
     if (!session.pending.active || session.pending.expected <= 0) {
         return;
     }
@@ -1443,8 +1547,13 @@ static void kislay_handle_socketio_binary(php_kislay_socket_server_t *server,
         return;
     }
 
-    kislay_replace_placeholders(&session.pending.payload, session.pending.binaries);
-    kislay_queue_event_locked(server, sid, session.pending.event, &session.pending.payload, pending);
+    kislay_raw_event ev;
+    ev.kind = kislay_raw_event::Kind::Dispatch;
+    ev.sid = sid;
+    ev.raw_packet = session.pending.raw_packet;
+    ev.binaries = std::move(session.pending.binaries);
+    ev.is_binary_completion = true;
+    raw_events.push_back(std::move(ev));
     kislay_clear_pending(session.pending);
 }
 
@@ -1453,7 +1562,7 @@ static bool kislay_handle_engineio_packet(php_kislay_socket_server_t *server,
                                           kislay_socket_session &session,
                                           const char *data,
                                           size_t data_len,
-                                          std::vector<kislay_pending_call> &pending) {
+                                          std::vector<kislay_raw_event> &raw_events) {
     if (data_len == 0) {
         return false;
     }
@@ -1486,7 +1595,11 @@ static bool kislay_handle_engineio_packet(php_kislay_socket_server_t *server,
     }
 
     if (type == '1') {
-        kislay_queue_event_locked(server, sid, "disconnect", nullptr, pending);
+        kislay_raw_event ev;
+        ev.kind = kislay_raw_event::Kind::Dispatch;
+        ev.sid = sid;
+        ev.event = "disconnect";
+        raw_events.push_back(std::move(ev));
         kislay_remove_client(server, sid);
         return true;
     }
@@ -1497,22 +1610,20 @@ static bool kislay_handle_engineio_packet(php_kislay_socket_server_t *server,
 
     if (type == '4') {
         if (data_len > 1 && data[1] == 'b') {
-            zend_string *decoded = php_base64_decode_ex(reinterpret_cast<const unsigned char *>(data + 2), data_len - 2, 0);
-            if (decoded != nullptr) {
-                kislay_handle_socketio_binary(server, sid, session, ZSTR_VAL(decoded), ZSTR_LEN(decoded), pending);
-                zend_string_release(decoded);
+            std::string decoded = kislay_base64_decode_raw(data + 2, data_len - 2);
+            if (!decoded.empty()) {
+                kislay_handle_socketio_binary(server, sid, session, decoded.data(), decoded.size(), raw_events);
             }
             return false;
         }
-        kislay_handle_socketio_packet(server, sid, session, std::string(data + 1, data_len - 1), pending);
+        kislay_handle_socketio_packet(server, sid, session, std::string(data + 1, data_len - 1), raw_events);
         return false;
     }
 
     if (type == 'b') {
-        zend_string *decoded = php_base64_decode_ex(reinterpret_cast<const unsigned char *>(data + 1), data_len - 1, 0);
-        if (decoded != nullptr) {
-            kislay_handle_socketio_binary(server, sid, session, ZSTR_VAL(decoded), ZSTR_LEN(decoded), pending);
-            zend_string_release(decoded);
+        std::string decoded = kislay_base64_decode_raw(data + 1, data_len - 1);
+        if (!decoded.empty()) {
+            kislay_handle_socketio_binary(server, sid, session, decoded.data(), decoded.size(), raw_events);
         }
     }
 
@@ -1664,7 +1775,6 @@ static int kislay_http_handler(struct mg_connection *conn, void *cbdata) {
             session.pending.active = false;
             session.pending.expected = 0;
             session.pending.received = 0;
-            ZVAL_UNDEF(&session.pending.payload);
             session.last_ping = std::chrono::steady_clock::now();
             session.last_pong = session.last_ping;
             kislay_capture_handshake(conn, session);
@@ -1736,12 +1846,11 @@ static int kislay_http_handler(struct mg_connection *conn, void *cbdata) {
             body.resize(read_total);
         }
 
-        std::vector<kislay_pending_call> pending;
-        // Acquired before server->lock, always in this order (also the order
-        // used by the Redis subscriber thread) to avoid a lock-order
-        // inversion between this mutex and server->lock. See
-        // kislay_socket_php_call_lock.
-        std::lock_guard<std::recursive_mutex> php_guard(kislay_socket_php_call_lock);
+        // No kislay_socket_php_call_lock here anymore: this thread never
+        // touches Zend at all now. It only builds plain-data kislay_raw_event
+        // entries and hands them to the main thread via server->raw_event_queue -
+        // see the comment on kislay_raw_event for why.
+        std::vector<kislay_raw_event> raw_events;
         std::unique_lock<std::mutex> lock(server->lock);
         auto session_it = server->sessions.find(sid_it->second);
         if (session_it == server->sessions.end()) {
@@ -1755,15 +1864,20 @@ static int kislay_http_handler(struct mg_connection *conn, void *cbdata) {
             packets.emplace_back(body.data(), body.size());
         }
         for (const auto &packet : packets) {
-            bool closed = kislay_handle_engineio_packet(server, sid_it->second, session_it->second, packet.data(), packet.size(), pending);
+            bool closed = kislay_handle_engineio_packet(server, sid_it->second, session_it->second, packet.data(), packet.size(), raw_events);
             if (closed) {
                 kislay_clear_pending(session_it->second.pending);
                 server->sessions.erase(session_it);
                 break;
             }
         }
+        if (!raw_events.empty()) {
+            for (auto &ev : raw_events) {
+                server->raw_event_queue.push_back(std::move(ev));
+            }
+            server->work_cv.notify_one();
+        }
         lock.unlock();
-        kislay_run_pending_calls(server, pending);
         kislay_send_http_response(conn, 200, "ok", server->cors_enabled);
         return 1;
     }
@@ -1827,7 +1941,6 @@ static void kislay_ws_ready_handler(struct mg_connection *conn, void *cbdata) {
         session.pending.active = false;
         session.pending.expected = 0;
         session.pending.received = 0;
-        ZVAL_UNDEF(&session.pending.payload);
         session.last_ping = std::chrono::steady_clock::now();
         session.last_pong = session.last_ping;
         kislay_capture_handshake(conn, session);
@@ -1847,7 +1960,6 @@ static void kislay_ws_ready_handler(struct mg_connection *conn, void *cbdata) {
             session.pending.active = false;
             session.pending.expected = 0;
             session.pending.received = 0;
-            ZVAL_UNDEF(&session.pending.payload);
             session.last_ping = std::chrono::steady_clock::now();
             session.last_pong = session.last_ping;
             server->sessions.emplace(sid, session);
@@ -1870,10 +1982,9 @@ static int kislay_ws_data_handler(struct mg_connection *conn, int bits, char *da
 #endif
 
     auto *server = static_cast<php_kislay_socket_server_t *>(cbdata);
-    std::vector<kislay_pending_call> pending;
-    // See kislay_socket_php_call_lock for why this is acquired before
-    // server->lock, consistently, everywhere.
-    std::lock_guard<std::recursive_mutex> php_guard(kislay_socket_php_call_lock);
+    // No kislay_socket_php_call_lock here anymore: this thread never touches
+    // Zend at all now - see the comment on kislay_raw_event.
+    std::vector<kislay_raw_event> raw_events;
     std::unique_lock<std::mutex> lock(server->lock);
     auto sid_it = server->conn_to_sid.find(conn);
     if (sid_it == server->conn_to_sid.end()) {
@@ -1890,23 +2001,26 @@ static int kislay_ws_data_handler(struct mg_connection *conn, int bits, char *da
 
     if ((bits & MG_WEBSOCKET_OPCODE_TEXT) == 0) {
         if ((bits & MG_WEBSOCKET_OPCODE_BINARY) != 0) {
-            kislay_handle_socketio_binary(server, sid_it->second, session_it->second, data, data_len, pending);
+            kislay_handle_socketio_binary(server, sid_it->second, session_it->second, data, data_len, raw_events);
+        }
+        if (!raw_events.empty()) {
+            for (auto &ev : raw_events) { server->raw_event_queue.push_back(std::move(ev)); }
+            server->work_cv.notify_one();
         }
         lock.unlock();
-        kislay_run_pending_calls(server, pending);
         return 1;
     }
 
     std::vector<std::string> packets = kislay_engineio_parse_payload(data, data_len);
     if (packets.empty()) {
-        bool closed = kislay_handle_engineio_packet(server, sid_it->second, session_it->second, data, data_len, pending);
+        bool closed = kislay_handle_engineio_packet(server, sid_it->second, session_it->second, data, data_len, raw_events);
         if (closed) {
             kislay_clear_pending(session_it->second.pending);
             server->sessions.erase(session_it);
         }
     } else {
         for (const auto &packet : packets) {
-            bool closed = kislay_handle_engineio_packet(server, sid_it->second, session_it->second, packet.data(), packet.size(), pending);
+            bool closed = kislay_handle_engineio_packet(server, sid_it->second, session_it->second, packet.data(), packet.size(), raw_events);
             if (closed) {
                 kislay_clear_pending(session_it->second.pending);
                 server->sessions.erase(session_it);
@@ -1914,17 +2028,17 @@ static int kislay_ws_data_handler(struct mg_connection *conn, int bits, char *da
             }
         }
     }
+    if (!raw_events.empty()) {
+        for (auto &ev : raw_events) { server->raw_event_queue.push_back(std::move(ev)); }
+        server->work_cv.notify_one();
+    }
     lock.unlock();
-    kislay_run_pending_calls(server, pending);
     return 1;
 }
 
 static void kislay_ws_close_handler(const struct mg_connection *conn, void *cbdata) {
     auto *server = static_cast<php_kislay_socket_server_t *>(cbdata);
-    std::vector<kislay_pending_call> pending;
-    // See kislay_socket_php_call_lock for why this is acquired before
-    // server->lock, consistently, everywhere.
-    std::lock_guard<std::recursive_mutex> php_guard(kislay_socket_php_call_lock);
+    // No kislay_socket_php_call_lock here anymore - see kislay_raw_event.
     std::unique_lock<std::mutex> lock(server->lock);
 
     auto sid_it = server->conn_to_sid.find(const_cast<struct mg_connection *>(conn));
@@ -1939,13 +2053,16 @@ static void kislay_ws_close_handler(const struct mg_connection *conn, void *cbda
     if (session_it != server->sessions.end()) {
         session_it->second.ws_conn = nullptr;
         session_it->second.ws_upgraded = false;
-        kislay_queue_event_locked(server, sid, "disconnect", nullptr, pending);
+        kislay_raw_event ev;
+        ev.kind = kislay_raw_event::Kind::Dispatch;
+        ev.sid = sid;
+        ev.event = "disconnect";
+        server->raw_event_queue.push_back(std::move(ev));
+        server->work_cv.notify_one();
         kislay_remove_client(server, sid);
         kislay_clear_pending(session_it->second.pending);
         server->sessions.erase(session_it);
     }
-    lock.unlock();
-    kislay_run_pending_calls(server, pending);
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -2064,63 +2181,130 @@ static void kislay_redis_sub_thread_func(php_kislay_socket_server_t *server) {
                 const std::string &channel = parts[2];
                 const std::string &payload = parts[3];
 
-                // This whole block runs on the Redis subscriber thread, a
-                // second (and separate from the civetweb worker) non-script
-                // thread touching Zend (php_json_decode below, plus
-                // php_json_encode inside kislay_send_socketio_event via
-                // kislay_broadcast/kislay_emit_room) - see
-                // kislay_socket_php_call_lock.
-                std::lock_guard<std::recursive_mutex> php_guard(kislay_socket_php_call_lock);
-
-                /* Decode JSON payload {"event":"...", "data":<json>} */
-                zval decoded;
-                if (php_json_decode(&decoded,
-                                    payload.c_str(),
-                                    static_cast<size_t>(payload.size()),
-                                    true,
-                                    PHP_JSON_PARSER_DEFAULT_DEPTH) != SUCCESS) {
-                    continue;
-                }
-                if (Z_TYPE(decoded) != IS_ARRAY) {
-                    zval_ptr_dtor(&decoded);
-                    continue;
-                }
-
-                zval *ev_val = zend_hash_str_find(Z_ARRVAL(decoded), "event", sizeof("event") - 1);
-                zval *data_val = zend_hash_str_find(Z_ARRVAL(decoded), "data", sizeof("data") - 1);
-                if (ev_val == nullptr || Z_TYPE_P(ev_val) != IS_STRING) {
-                    zval_ptr_dtor(&decoded);
-                    continue;
-                }
-
-                std::string event(Z_STRVAL_P(ev_val), Z_STRLEN_P(ev_val));
-
-                bool is_broadcast = (channel == pat_broadcast);
-                std::string room;
-                if (!is_broadcast) {
-                    /* channel = "{prefix}room:{roomname}" */
-                    size_t room_offset = prefix.size() + 5; /* "room:" is 5 chars */
-                    if (channel.size() > room_offset) {
-                        room = channel.substr(room_offset);
-                    }
-                }
-
+                // This thread must never touch Zend directly (see the
+                // kislay_raw_event comment) - decoding the JSON envelope and
+                // dispatching via kislay_broadcast()/kislay_emit_room() both
+                // do, so just hand the raw channel+payload bytes to the main
+                // thread via server->raw_event_queue and let
+                // kislay_process_raw_events() do the rest.
+                kislay_raw_event ev;
+                ev.kind = kislay_raw_event::Kind::RedisMessage;
+                ev.redis_channel = channel;
+                ev.redis_payload = payload;
                 {
                     std::lock_guard<std::mutex> guard(server->lock);
-                    if (is_broadcast) {
-                        kislay_broadcast(server, event, data_val, /* skip_redis= */ true);
-                    } else if (!room.empty()) {
-                        kislay_emit_room(server, room, event, data_val, /* skip_redis= */ true);
-                    }
+                    server->raw_event_queue.push_back(std::move(ev));
                 }
-
-                zval_ptr_dtor(&decoded);
+                server->work_cv.notify_one();
             }
         }
 
         ::close(fd);
         server->redis_sub_fd = -1;
     }
+}
+
+/* The ONLY function in this file that turns a plain-data kislay_raw_event
+ * into a real Zend call - and, by construction, the only caller of this
+ * function is the housekeeping loop inside PHP_METHOD(KislaySocketServer,
+ * listen), which runs exclusively on the single OS thread that originally
+ * activated this PHP request. Every other thread (civetweb worker(s), the
+ * Redis subscriber thread) only ever produces kislay_raw_event entries and
+ * pushes them onto server->raw_event_queue - see the comment on
+ * kislay_raw_event for the full rationale. */
+static void kislay_process_raw_events(php_kislay_socket_server_t *server,
+                                      std::vector<kislay_raw_event> &events) {
+    std::vector<kislay_pending_call> pending;
+    for (auto &raw : events) {
+        if (raw.kind == kislay_raw_event::Kind::RedisMessage) {
+            /* Decode JSON payload {"event":"...", "data":<json>} - mirrors
+             * what kislay_redis_sub_thread_func used to do inline before it
+             * had to stop touching Zend. */
+            zval decoded;
+            if (php_json_decode(&decoded,
+                                raw.redis_payload.c_str(),
+                                raw.redis_payload.size(),
+                                true,
+                                PHP_JSON_PARSER_DEFAULT_DEPTH) != SUCCESS) {
+                continue;
+            }
+            if (Z_TYPE(decoded) != IS_ARRAY) {
+                zval_ptr_dtor(&decoded);
+                continue;
+            }
+
+            zval *ev_val = zend_hash_str_find(Z_ARRVAL(decoded), "event", sizeof("event") - 1);
+            zval *data_val = zend_hash_str_find(Z_ARRVAL(decoded), "data", sizeof("data") - 1);
+            if (ev_val == nullptr || Z_TYPE_P(ev_val) != IS_STRING) {
+                zval_ptr_dtor(&decoded);
+                continue;
+            }
+            std::string event(Z_STRVAL_P(ev_val), Z_STRLEN_P(ev_val));
+
+            const std::string &prefix = server->redis_channel_prefix;
+            std::string pat_broadcast = prefix + "broadcast";
+            bool is_broadcast = (raw.redis_channel == pat_broadcast);
+            std::string room;
+            if (!is_broadcast) {
+                size_t room_offset = prefix.size() + 5; /* "room:" is 5 chars */
+                if (raw.redis_channel.size() > room_offset) {
+                    room = raw.redis_channel.substr(room_offset);
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> guard(server->lock);
+                if (is_broadcast) {
+                    kislay_broadcast(server, event, data_val, /* skip_redis= */ true);
+                } else if (!room.empty()) {
+                    kislay_emit_room(server, room, event, data_val, /* skip_redis= */ true);
+                }
+            }
+
+            zval_ptr_dtor(&decoded);
+            continue;
+        }
+
+        /* Kind::Dispatch */
+        std::string event = raw.event;
+        zval payload;
+        ZVAL_UNDEF(&payload);
+        bool have_payload = false;
+
+        if (!raw.raw_packet.empty()) {
+            /* Event name not pre-known - JSON-decode raw_packet here, on the
+             * main thread, exactly as kislay_handle_socketio_packet used to
+             * do inline on the civetweb worker thread. */
+            std::string parsed_event;
+            int attachments = 0;
+            bool is_binary = false;
+            if (!kislay_parse_socketio_event_packet(raw.raw_packet.data(), raw.raw_packet.size(),
+                                                     parsed_event, &payload, &attachments, &is_binary)) {
+                if (!Z_ISUNDEF(payload)) { zval_ptr_dtor(&payload); }
+                continue;
+            }
+            event = parsed_event;
+            have_payload = !Z_ISUNDEF(payload);
+            if (raw.is_binary_completion && !raw.binaries.empty()) {
+                kislay_replace_placeholders(&payload, raw.binaries);
+            }
+        }
+
+        kislay_socket_session handshake_session{};
+        const kislay_socket_session *sptr = nullptr;
+        if (raw.has_handshake) {
+            handshake_session.handshake_path = raw.handshake_path;
+            handshake_session.handshake_query_string = raw.handshake_query_string;
+            handshake_session.handshake_headers = raw.handshake_headers;
+            sptr = &handshake_session;
+        }
+
+        kislay_queue_event_locked(server, raw.sid, event, have_payload ? &payload : nullptr, pending, sptr);
+        if (have_payload) {
+            zval_ptr_dtor(&payload);
+        }
+    }
+    kislay_run_pending_calls(server, pending);
 }
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislay_socket_void, 0, 0, 0)
@@ -2425,12 +2609,20 @@ PHP_METHOD(KislaySocketServer, listen) {
         server->redis_sub_thread = std::thread(kislay_redis_sub_thread_func, server);
     }
 
+    // This loop is THE single main thread - see kislay_process_raw_events
+    // and the kislay_raw_event comment for why every Zend call in this file
+    // (event dispatch, Redis-relay decode/broadcast, everything) now happens
+    // exclusively here, never on a civetweb worker thread or the Redis
+    // subscriber thread. Previously this loop only ticked once every
+    // 1000ms; it now also wakes immediately whenever server->raw_event_queue
+    // gets new work, via work_cv, so realtime dispatch latency stays low
+    // while the ping/pong housekeeping scan below still runs at least once
+    // a second.
     server->running = true;
     while (server->running) {
-        std::vector<kislay_pending_call> pending;
-        std::vector<std::string> timed_out;
+        std::vector<kislay_raw_event> to_process;
         {
-            std::lock_guard<std::mutex> guard(server->lock);
+            std::unique_lock<std::mutex> lock(server->lock);
             auto now = std::chrono::steady_clock::now();
             std::vector<std::string> expired;
             for (auto &entry : server->sessions) {
@@ -2448,23 +2640,6 @@ PHP_METHOD(KislaySocketServer, listen) {
                 }
             }
 
-            // FIXED (2026-08-12, see memory socket_websocket_crash_fix.md):
-            // kislay_queue_event_locked() used to be called from inside this
-            // same server->lock scope - it internally acquires
-            // kislay_socket_php_call_lock, so that made server->lock the
-            // OUTER lock and php_call_lock the INNER one here, the exact
-            // reverse of every other call site in this file (which always
-            // acquire php_call_lock first, server->lock second, or never
-            // hold server->lock at all when calling into it - see the
-            // "Acquired before server->lock, always in this order" comments
-            // elsewhere). A genuine, previously-undocumented lock-order
-            // inversion between this housekeeping loop (which runs on the
-            // main PHP script thread every 1000ms - NOT parked inside
-            // listen() as an older comment nearby claimed) and every
-            // civetweb/Redis-thread call site. Now: only the non-Zend
-            // cleanup (packet send, map erasure) happens under server->lock;
-            // the sid is collected into timed_out and kislay_queue_event_locked
-            // is called after the lock is released, below.
             for (const auto &sid : expired) {
                 auto sit = server->sessions.find(sid);
                 if (sit == server->sessions.end()) {
@@ -2477,14 +2652,36 @@ PHP_METHOD(KislaySocketServer, listen) {
                 kislay_remove_client(server, sid);
                 kislay_clear_pending(sit->second.pending);
                 server->sessions.erase(sit);
-                timed_out.push_back(sid);
+
+                kislay_raw_event ev;
+                ev.kind = kislay_raw_event::Kind::Dispatch;
+                ev.sid = sid;
+                ev.event = "disconnect";
+                to_process.push_back(std::move(ev));
+            }
+
+            if (!server->raw_event_queue.empty()) {
+                for (auto &ev : server->raw_event_queue) {
+                    to_process.push_back(std::move(ev));
+                }
+                server->raw_event_queue.clear();
+            }
+
+            if (to_process.empty()) {
+                server->work_cv.wait_for(lock, std::chrono::milliseconds(1000), [&]() {
+                    return !server->raw_event_queue.empty() || !server->running;
+                });
+                if (!server->raw_event_queue.empty()) {
+                    for (auto &ev : server->raw_event_queue) {
+                        to_process.push_back(std::move(ev));
+                    }
+                    server->raw_event_queue.clear();
+                }
             }
         }
-        for (const auto &sid : timed_out) {
-            kislay_queue_event_locked(server, sid, "disconnect", nullptr, pending);
+        if (!to_process.empty()) {
+            kislay_process_raw_events(server, to_process);
         }
-        kislay_run_pending_calls(server, pending);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
 
     RETURN_TRUE;
