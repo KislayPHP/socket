@@ -527,8 +527,26 @@ struct kislay_raw_event {
     std::string redis_payload;
 };
 
+// IMPORTANT: `zend_object std` is deliberately the LAST member of this
+// struct, not the first. zend_object's own layout ends with an implicit
+// trailing `properties_table[1]` placeholder slot, and
+// zend_object_properties_size(ce) returns -(int)sizeof(zval) for a class
+// with zero declared PHP properties (all four classes in this file
+// register none) SPECIFICALLY so that
+// `ecalloc(1, sizeof(struct) + zend_object_properties_size(ce))` trims
+// that one placeholder slot back off again - correct ONLY when
+// `zend_object` is the last member, so the trim lands on zend_object's own
+// trailing slot. With `zend_object` first (as this struct used to declare
+// it), the same arithmetic instead trims 16 bytes off the END of the
+// whole struct - i.e. off the C++ members below, not off zend_object -
+// silently under-allocating every object of this class by 16 bytes and
+// corrupting whatever memory follows it on the heap. This was found to be
+// the case for all four PHP-visible classes in this file and is the
+// leading suspect for this file's long-standing zend_mm_heap
+// corrupted / heap-corruption crash (see project memory
+// socket_websocket_crash_fix.md) - it exactly matches the crash's
+// allocator-independent, detected-late-at-an-unrelated-allocation profile.
 typedef struct _php_kislay_socket_server_t {
-    zend_object std;
     struct mg_context *ctx;
     std::string path;
     std::unordered_map<std::string, zval> handlers;
@@ -577,12 +595,15 @@ typedef struct _php_kislay_socket_server_t {
      * the subscriber thread's blocking recv/poll) - a plain int here is an
      * unsynchronized data race between those two threads. */
     std::atomic<int> redis_sub_fd{-1};
+    zend_object std;
 } php_kislay_socket_server_t;
 
+// See the comment above php_kislay_socket_server_t: `zend_object std` MUST
+// be the LAST member of a custom object struct.
 typedef struct _php_kislay_socket_client_t {
-    zend_object std;
     std::string sid;
     php_kislay_socket_server_t *server;
+    zend_object std;
 } php_kislay_socket_client_t;
 
 static void kislay_remove_client(php_kislay_socket_server_t *server, const std::string &sid);
@@ -591,16 +612,18 @@ static zend_object_handlers kislay_socket_server_handlers;
 static zend_object_handlers kislay_socket_client_handlers;
 static zend_object_handlers kislay_ack_handlers_obj;
 static zend_object_handlers kislay_namespace_handlers_obj;
+// See the comment above php_kislay_socket_server_t: `zend_object std` MUST
+// be the LAST member of a custom object struct.
 typedef struct _php_kislay_ack_t {
-    zend_object std;
     std::string sid;
     php_kislay_socket_server_t *server;
+    zend_object std;
 } php_kislay_ack_t;
 
 typedef struct _php_kislay_namespace_t {
-    zend_object std;
     zval server_obj;
     std::string ns;
+    zend_object std;
 } php_kislay_namespace_t;
 
 static inline php_kislay_ack_t *php_kislay_ack_from_obj(zend_object *obj) {
