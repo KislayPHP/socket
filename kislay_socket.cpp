@@ -949,6 +949,49 @@ static std::vector<std::string> kislay_engineio_parse_payload(const char *data, 
 // packet-handling scope).
 static std::recursive_mutex kislay_socket_php_call_lock;
 
+/* 2026-08-26 session update, after the single-thread rearchitecture above
+ * (kislay_raw_event) DISPROVED the cross-OS-thread hypothesis this lock was
+ * originally built around: the crash still reproduces 100%/instantly with
+ * zero cross-thread Zend calls, and a separate housekeeping-loop lock-order
+ * fix also didn't change the crash rate. Root cause is still open. This
+ * session's new finding: the corruption is NOT a zend_mm-internal artifact.
+ * Running the server with USE_ZEND_ALLOC=0 (routes emalloc/efree through
+ * real malloc/free, see Zend/zend_alloc.c) plus macOS's built-in
+ * MallocScribble=1/MallocPreScribble=1 (no library injection needed)
+ * reproduces the identical bug via a COMPLETELY DIFFERENT allocator (Apple's
+ * "xzone malloc", not zend_mm) - 13/15 trials crashed with a SINGLE client's
+ * SINGLE connect+subscribe(join) round, no second dispatch needed. A live
+ * lldb capture (breakpoint on `malloc_error_break`) got a full real
+ * backtrace: stress_server.php's subscribe handler calls
+ * `$client->join(sprintf('account:%s',$accountId))` -> zim_KislaySocketClient_join
+ * (kislay_socket.cpp, `server->rooms[room_name]`, a plain
+ * std::unordered_map<std::string,...> insert with NO Zend/zval involvement)
+ * -> a fresh C++ `operator new` for the hash node -> corruption detected in
+ * the shared small-object freelist. This means every prior session's
+ * disassembly-confirmed "ZEND_ROPE_END/zend_string_alloc UAF" captures were
+ * most likely just the statistically-likeliest NEXT allocation to reuse a
+ * poisoned freelist slot (string/rope building being the most frequent small
+ * allocation in these closures) - not proof the bug is specific to
+ * ZEND_ROPE/zend_string_alloc as a mechanism. The actual corrupting write's
+ * location is still not identified (no debug symbols for
+ * libsystem_malloc.dylib to unwind past the detection frame), but this is
+ * now confirmed to be a REAL, allocator-independent memory-safety violation,
+ * not a zend_mm-specific false positive. See tests/malloc_debug_repro_test.php
+ * for a fast, reusable repro (single client, single round, ~87% hit rate) and
+ * project memory socket_websocket_crash_fix.md for full details, including
+ * two dead ends closed out this session: ASan (deadlocks in Apple's
+ * AsanInitFromRtl() on this machine even for a bare `php -v` with the ASan
+ * dylib interposed via DYLD_INSERT_LIBRARIES into an otherwise-unmodified
+ * php binary - not just for a from-source ASan PHP build as previously
+ * documented), and libgmalloc.dylib (Guard Malloc) combined with
+ * USE_ZEND_ALLOC=0 (crashes during kislay_socket_server_create_object's
+ * std::thread placement-new, before any traffic - an environmental
+ * incompatibility, not informative). Also definitively closed: the
+ * "readable text in corrupted metadata resembles civetweb.c's CGI
+ * interpreter-script comment" lead from an earlier session - that text is
+ * inside a C comment (stripped by the preprocessor, never compiled into the
+ * binary) AND inside Windows-only code (`GetFullPathNameA`) that doesn't
+ * even compile on this platform. Pure coincidence, not a real clue. */
 static bool kislay_call_php(zval *callable, uint32_t argc, zval *argv, zval *retval) {
     std::lock_guard<std::recursive_mutex> guard(kislay_socket_php_call_lock);
 #if defined(ZEND_CHECK_STACK_LIMIT)
