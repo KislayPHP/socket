@@ -5,7 +5,7 @@ extern "C" {
 #include "php.h"
 }
 
-#define PHP_KISLAYPHP_SOCKET_VERSION "0.0.1"
+#define PHP_KISLAYPHP_SOCKET_VERSION "1.0.0"
 #define PHP_KISLAYPHP_SOCKET_EXTNAME "kislayphp_socket"
 
 extern zend_module_entry kislayphp_socket_module_entry;

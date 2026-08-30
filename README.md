@@ -2,20 +2,16 @@
 
 Kislay Socket is the realtime socket transport package for KislayPHP. It provides long-running socket communication with Engine.IO polling, WebSocket upgrade support, rooms, namespaces, and event callbacks.
 
-During `0.0.x`, the package keeps compatibility aliases for existing EventBus namespaces:
+The package keeps compatibility aliases for existing EventBus namespaces:
 - `Kislay\\Socket\\*` is the primary API
-- `Kislay\\EventBus\\*` and `KislayPHP\\EventBus\\*` remain available as compatibility aliases
-
-## Versioning
-
-This package stays on the `0.0.x` line until the transport surface, docs, and ecosystem integration are production-ready.
+- `Kislay\\EventBus\\*` and `KislayPHP\\EventBus\\*` remain available as compatibility aliases (permanently — not just during a transitional version line)
 
 ## Installation
 
 ### PIE
 
 ```bash
-pie install kislayphp/socket:0.0.1
+pie install kislayphp/socket:1.0.0
 ```
 
 Add to `php.ini`:
@@ -71,6 +67,7 @@ $server->listen('0.0.0.0', 3000, '/socket.io/');
 - `onWithAck(string $event, callable $handler): bool`
 - `getClients(): array`
 - `setMaxPayload(int $bytes): bool`
+- `setThreads(int $n): bool` — civetweb worker thread count; call before `listen()`. Defaults to 4 (env `KISLAYPHP_SOCKET_THREADS` overrides). Matters for real concurrency: each long-polling connection occupies one worker thread for up to `ping_interval_ms` while waiting, so a server handling more concurrent long-polling clients than it has threads will queue behind whichever connections are already blocked.
 - `namespace(string $ns): Kislay\\Socket\\Namespace`
 
 ### `Kislay\\Socket\\Socket`
@@ -102,8 +99,9 @@ Primary environment variables:
 - `KISLAYPHP_SOCKET_AUTH_TOKEN`
 - `KISLAYPHP_SOCKET_AUTH_QUERY_KEYS`
 - `KISLAYPHP_SOCKET_AUTH_HEADER_KEYS`
+- `KISLAYPHP_SOCKET_THREADS` — civetweb worker thread count, default 4 (see `setThreads()` above)
 
-Legacy `KISLAYPHP_EVENTBUS_*` and `KISLAYPHP_AUTH_*` environment variables are still accepted during `0.0.x` for migration compatibility.
+Legacy `KISLAYPHP_EVENTBUS_*` and `KISLAYPHP_AUTH_*` environment variables are still accepted as fallbacks for migration compatibility.
 
 ## Current Limits
 
