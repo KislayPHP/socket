@@ -577,6 +577,11 @@ typedef struct _php_kislay_socket_server_t {
     int ping_interval_ms;
     int ping_timeout_ms;
     size_t max_payload;
+    /* civetweb num_threads: 0 means "unset", resolved in listen() as
+     * env var > setThreads() > default. See setThreads()'s comment for why
+     * this matters - civetweb's worker pool caps concurrent HTTP connections
+     * (long-polling GETs included) to this count. */
+    int thread_count;
     zval auth_handler;
     bool has_auth_handler;
     std::unordered_map<std::string, zval> ack_handlers;
@@ -2429,6 +2434,10 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_kislay_socket_set_max_payload, 0, 0, 1)
     ZEND_ARG_TYPE_INFO(0, bytes, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislay_socket_set_threads, 0, 0, 1)
+    ZEND_ARG_TYPE_INFO(0, n, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislay_socket_namespace, 0, 0, 1)
     ZEND_ARG_TYPE_INFO(0, ns, IS_STRING, 0)
 ZEND_END_ARG_INFO()
@@ -2637,8 +2646,37 @@ PHP_METHOD(KislaySocketServer, listen) {
     std::string opt_port = listen_addr;
     options.push_back("listening_ports");
     options.push_back(opt_port.c_str());
+    // civetweb's worker pool caps the number of HTTP connections it can
+    // service concurrently to num_threads - this previously hardcoded "1",
+    // which meant a single long-polling GET (transport=polling) occupied
+    // the server's ONLY worker thread for up to ping_interval_ms (25s
+    // default) while blocked in cv.wait_for(). A client that gave up and
+    // closed its socket (its own curl/HTTP timeout) left that thread
+    // stuck anyway - the server has no way to notice the disconnect while
+    // parked in a condition-variable wait - so it starved every other
+    // concurrent connection (including delivering real-time messages to
+    // OTHER still-connected clients) for the remainder of that window.
+    // Reproduced deterministically via a 2-member room where one member
+    // leaves and the other then self-sends a room broadcast while both
+    // still have an open long-poll: the departed member's abandoned poll
+    // starved the remaining member's own delivery. Mirrors eventbus's
+    // existing KISLAYPHP_EVENTBUS_THREADS/setThreads() pattern (env var >
+    // explicit setThreads() > default).
+    int effective_threads = 4;
+    zend_long env_threads = kislay_env_long_any("KISLAYPHP_SOCKET_THREADS", "KISLAYPHP_EVENTBUS_THREADS", 0);
+    if (env_threads > 0) {
+        effective_threads = static_cast<int>(env_threads);
+    }
+    if (server->thread_count > 0) {
+        effective_threads = server->thread_count;
+    }
+    // Kept alive in this stack frame (not a static/shared string) until
+    // mg_start() below consumes it synchronously - avoids the cross-instance
+    // race a shared `static std::string` would have if two servers' listen()
+    // calls interleaved.
+    std::string thread_count_str = std::to_string(effective_threads);
     options.push_back("num_threads");
-    options.push_back("1");
+    options.push_back(thread_count_str.c_str());
     // civetweb's mg_websocket_write_exec() sends the frame header and payload
     // as two separate mg_write() calls. Without tcp_nodelay, Nagle holds the
     // small payload write until the client ACKs the header write, and that
@@ -3052,6 +3090,16 @@ PHP_METHOD(KislaySocketServer, setMaxPayload) {
     RETURN_TRUE;
 }
 
+PHP_METHOD(KislaySocketServer, setThreads) {
+    zend_long n;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_LONG(n)
+    ZEND_PARSE_PARAMETERS_END();
+    php_kislay_socket_server_t *server = php_kislay_socket_server_from_obj(Z_OBJ_P(getThis()));
+    server->thread_count = (int)(n > 0 ? n : 1);
+    RETURN_TRUE;
+}
+
 PHP_METHOD(KislaySocketServer, namespace) {
     char *ns = nullptr;
     size_t ns_len = 0;
@@ -3210,6 +3258,7 @@ static const zend_function_entry kislay_socket_server_methods[] = {
     PHP_ME(KislaySocketServer, onWithAck, arginfo_kislay_socket_on_with_ack, ZEND_ACC_PUBLIC)
     PHP_ME(KislaySocketServer, getClients, arginfo_kislay_socket_get_clients, ZEND_ACC_PUBLIC)
     PHP_ME(KislaySocketServer, setMaxPayload, arginfo_kislay_socket_set_max_payload, ZEND_ACC_PUBLIC)
+    PHP_ME(KislaySocketServer, setThreads, arginfo_kislay_socket_set_threads, ZEND_ACC_PUBLIC)
     PHP_ME(KislaySocketServer, namespace, arginfo_kislay_socket_namespace, ZEND_ACC_PUBLIC)
     PHP_ME(KislaySocketServer, setRedis, arginfo_kislay_socket_set_redis, ZEND_ACC_PUBLIC)
     PHP_FE_END
